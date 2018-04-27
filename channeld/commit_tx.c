@@ -254,9 +254,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 	 *
 	 * ## Commitment Transaction
 	 *
-	 * * version: 2
+	 * * version: 12
 	 */
-	assert(tx->version == 2);
+	assert(tx->version == 12);
 
 	/* BOLT #3:
 	 *

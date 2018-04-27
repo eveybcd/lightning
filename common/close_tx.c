@@ -24,7 +24,7 @@ struct bitcoin_tx *create_close_tx(const tal_t *ctx,
 	 *
 	 * Note that there are two possible variants for each node.
 	 *
-	 * * version: 2
+	 * * version: 12
 	 * * locktime: 0
 	 * * txin count: 1
 	 */

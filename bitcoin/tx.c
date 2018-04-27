@@ -87,6 +87,10 @@ static void push_tx(const struct bitcoin_tx *tx,
 
 	push_le32(tx->version, push, pushp);
 
+    if (tx->version == 12) {
+        push(&tx->present_block_hash, sizeof(tx->present_block_hash), pushp);
+    }
+
         if (bip144 && uses_witness(tx))
 		flag |= SEGREGATED_WITNESS_FLAG;
 
@@ -183,6 +187,10 @@ static void hash_for_segwit(struct sha256_ctx *ctx,
 	 *     1. nVersion of the transaction (4-byte little endian)
 	 */
 	push_le32(tx->version, push_sha, ctx);
+
+//    1.1 present_block_hash
+    if (tx->version == 12)
+        push_sha(&tx->present_block_hash, sizeof(tx->present_block_hash), ctx);
 
 	/*     2. hashPrevouts (32-byte hash) */
 	hash_prevouts(&h, tx);
@@ -299,7 +307,9 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx, varint_t input_count,
 		tx->input[i].witness = NULL;
 	}
 	tx->lock_time = 0;
-	tx->version = 2;
+	tx->version = 12;
+   // sha256_double_done(&ctx, &tx->present_block_hash); // todo: preblockhash
+	tx->present_block_hash = {{{.u.u8 = {0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00}}}},
 	return tx;
 }
 
@@ -390,6 +400,9 @@ struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
 	struct bitcoin_tx *tx = tal(ctx, struct bitcoin_tx);
 
 	tx->version = pull_le32(cursor, max);
+	if (tx->version == 12)
+		pull_sha256_double(cursor, max, &tx->present_block_hash);
+
 	count = pull_length(cursor, max, 32 + 4 + 4 + 1);
 	/* BIP 144 marker is 0 (impossible to have tx with 0 inputs) */
 	if (count == 0) {
