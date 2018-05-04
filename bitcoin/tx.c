@@ -190,7 +190,7 @@ static void hash_for_segwit(struct sha256_ctx *ctx,
 
 //    1.1 present_block_hash
     if (tx->version == 12)
-        push_sha(&tx->present_block_hash, sizeof(tx->present_block_hash), ctx);
+        {push_sha(&tx->present_block_hash, sizeof(tx->present_block_hash), ctx);}
 
 	/*     2. hashPrevouts (32-byte hash) */
 	hash_prevouts(&h, tx);
@@ -291,6 +291,15 @@ void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid)
 	sha256_double_done(&ctx, &txid->shad);
 }
 
+static struct bitcoin_txid txid_from_hex(const char *hex)
+{
+    struct bitcoin_txid txid;
+
+    if (!bitcoin_txid_from_hex(hex, strlen(hex), &txid))
+        abort();
+    return txid;
+}
+
 struct bitcoin_tx *bitcoin_tx(const tal_t *ctx, varint_t input_count,
 			      varint_t output_count)
 {
@@ -309,7 +318,8 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx, varint_t input_count,
 	tx->lock_time = 0;
 	tx->version = 12;
    // sha256_double_done(&ctx, &tx->present_block_hash); // todo: preblockhash
-	tx->present_block_hash = {{{.u.u8 = {0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00}}}},
+//	tx->present_block_hash = {{{.u.u8 = {0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00}}}};
+    tx->present_block_hash = txid_from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be").shad;
 	return tx;
 }
 

@@ -14,7 +14,7 @@ struct bitcoin_txid {
 
 struct bitcoin_tx {
 	u32 version;
-	struct bitcoin_blkid present_block_hash;
+	struct sha256_double present_block_hash;
 	struct bitcoin_tx_input *input;
 	struct bitcoin_tx_output *output;
 	u32 lock_time;
