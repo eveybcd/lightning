@@ -63,7 +63,16 @@ const struct chainparams networks[] = {
      .cli_args = NULL,
      .dust_limit = 546,
      .when_lightning_became_cool = 1,
-     .testnet = false}
+     .testnet = false},
+    {.index = 6,
+     .network_name = "bitcoindiamond-testnet",
+     .bip173_name = "tbcd",
+     .genesis_blockhash = {{{.u.u8 = {0x43, 0x49, 0x7f, 0xd7, 0xf8, 0x26, 0x95, 0x71, 0x08, 0xf4, 0xa3, 0x0f, 0xd9, 0xce, 0xc3, 0xae, 0xba, 0x79, 0x97, 0x20, 0x84, 0xe9, 0x0e, 0xad, 0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00}}}},
+     .rpc_port = 17116,
+     .cli = "bitcoindiamond-cli",
+     .cli_args = "-testnet",
+     .dust_limit = 546,
+     .testnet = true},
 };
 
 const struct chainparams *chainparams_for_network(const char *network_name)
