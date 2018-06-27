@@ -317,7 +317,8 @@ static void start_fee_estimate(struct chain_topology *topo)
 {
 	/* FEERATE_IMMEDIATE, FEERATE_NORMAL, FEERATE_SLOW */
 	const char *estmodes[] = { "CONSERVATIVE", "ECONOMICAL", "ECONOMICAL" };
-	const u32 blocks[] = { 2, 4, 100 };
+//	const u32 blocks[] = { 2, 4, 100 };
+	const u32 blocks[] = { 2, 4, 25 };
 
 	BUILD_ASSERT(ARRAY_SIZE(blocks) == NUM_FEERATES);
 

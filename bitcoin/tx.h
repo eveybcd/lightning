@@ -4,6 +4,7 @@
 #include "shadouble.h"
 #include "signature.h"
 #include "varint.h"
+#include "block.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 
@@ -13,6 +14,7 @@ struct bitcoin_txid {
 
 struct bitcoin_tx {
 	u32 version;
+	struct sha256_double present_block_hash;
 	struct bitcoin_tx_input *input;
 	struct bitcoin_tx_output *output;
 	u32 lock_time;

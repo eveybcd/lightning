@@ -351,9 +351,12 @@ static void do_one_estimatefee(struct bitcoind *bitcoind,
 	char blockstr[STR_MAX_CHARS(u32)];
 
 	sprintf(blockstr, "%u", efee->blocks[efee->i]);
+//	start_bitcoin_cli(bitcoind, NULL, process_estimatefee, false, NULL, efee,
+//			  "estimatesmartfee", blockstr, efee->estmode[efee->i],
+//			  NULL);
 	start_bitcoin_cli(bitcoind, NULL, process_estimatefee, false, NULL, efee,
-			  "estimatesmartfee", blockstr, efee->estmode[efee->i],
-			  NULL);
+					  "estimatesmartfee", blockstr,
+					  NULL);
 }
 
 void bitcoind_estimate_fees_(struct bitcoind *bitcoind,

@@ -28,9 +28,9 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 */
 
 	/* BOLT #3:
-	 * * version: 2
+	 * * version: 12
 	 */
-	assert(tx->version == 2);
+	assert(tx->version == 12);
 
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-Success, `cltv_expiry` for HTLC-Timeout.
