@@ -7,7 +7,8 @@
 6. [macOS](#to-build-on-macos)
 7. [Android](#to-cross-compile-for-android)
 8. [Raspberry Pi](#to-cross-compile-for-raspberry-pi)
-9. [Additional steps](#additional-steps)
+9. [Armbian](#to-compile-for-armbian)
+10. [Additional steps](#additional-steps)
 
 Library Requirements
 --------------------
@@ -15,6 +16,7 @@ Library Requirements
 You will need several development libraries:
 * libsqlite3: for database support.
 * libgmp: for secp256k1
+* zlib: for compression routines.
 
 For actually doing development and running the tests, you will also need:
 * pip3: to install python-bitcoinlib
@@ -34,7 +36,7 @@ Get dependencies:
     sudo apt-get update
     sudo apt-get install -y \
       autoconf automake build-essential git libtool libgmp-dev \
-      libsqlite3-dev python python3 net-tools libsodium-dev
+      libsqlite3-dev python python3 net-tools zlib1g-dev
 
 If you don't have Bitcoin installed locally you'll need to install that
 as well:
@@ -47,7 +49,7 @@ as well:
 For development or running tests, get additional dependencies:
 
     sudo apt-get install -y asciidoc valgrind python3-pip
-    sudo pip3 install python-bitcoinlib
+    sudo pip3 install -r tests/requirements.txt
 
 Clone lightning:
 
@@ -56,6 +58,7 @@ Clone lightning:
 
 Build lightning:
 
+    ./configure
     make
 
 Running lightning:
@@ -74,10 +77,11 @@ OS version: Fedora 27 or above
 Get dependencies:
 ```
 $ sudo dnf update -y && \
-        dnf groupinstall -y \
+        sudo dnf groupinstall -y \
                 'C Development Tools and Libraries' \
                 'Development Tools' && \
-        dnf install -y \
+        sudo dnf install -y \
+                asciidoc \
                 clang \
                 gmp-devel \
                 libsq3-devel \
@@ -86,11 +90,11 @@ $ sudo dnf update -y && \
                 python3-pip \
                 python3-setuptools \
                 net-tools \
-                libsodium-devel \
                 net-tools \
                 valgrind \
-                wget && \
-        dnf clean all
+                wget \
+                zlib-devel && \
+        sudo dnf clean all
 ```
 
 Make sure you have [bitcoind](https://github.com/bitcoin/bitcoin) available to run
@@ -103,6 +107,7 @@ $ cd lightning
 
 Build and install lightning:
 ```
+$lightning> ./configure
 $lightning> make
 $lightning> sudo make install
 ```
@@ -141,6 +146,7 @@ Clone lightning:
 
 Build lightning:
 
+    $ ./configure
     $ gmake
     $ gmake install
 
@@ -171,7 +177,7 @@ To Build on macOS
 Assume you have Xcode and HomeBrew installed on your Mac.
 Get dependencies:
 
-    $ brew install autoconf automake libtool python3 gmp libsodium gnu-sed
+    $ brew install autoconf automake libtool python3 gmp gnu-sed
 
 If you don't have bitcoind installed locally you'll need to install that
 as well:
@@ -191,6 +197,7 @@ Clone lightning:
 
 Build lightning:
 
+    $ ./configure
     $ make
 
 Running lightning:
@@ -234,7 +241,7 @@ This will allow you to properly configure
 the build for the target device environment.
 Build with:
 
-    BUILD=x86_64 HOST=arm-linux-androideabi \
+    BUILD=x86_64 MAKE_HOST=arm-linux-androideabi \
       make PIE=1 DEVELOPER=0 \
       CONFIGURATOR_CC="arm-linux-androideabi-clang -static"
 
@@ -258,13 +265,22 @@ Depending on your toolchain location and target arch, source env variables will 
 Install the `qemu-user` package. This will allow you to properly configure the build for the target device environment. Then, build with the following commands. (A 64-bit build system is assumed here.)
 
     make CC=gcc clean ccan/tools/configurator/configurator
-    BUILD=x86_64 HOST=arm-linux-gnueabihf make PIE=1 DEVELOPER=0 CONFIGURATOR_CC="arm-linux-gnueabihf-gcc -static" LDFLAGS="-L/path/to/gmp-and-sqlite/lib" CFLAGS="-std=gnu11 -I /path/to/gmp-and-sqlite/include -I . -I ccan -I external/libwally-core/src/secp256k1/include -I external/libsodium/src/libsodium/include -I external/jsmn -I external/libwally-core/include -I external/libbacktrace -I external/libbase58"
+    BUILD=x86_64 MAKE_HOST=arm-linux-gnueabihf make PIE=1 DEVELOPER=0 CONFIGURATOR_CC="arm-linux-gnueabihf-gcc -static" LDFLAGS="-L/path/to/gmp-and-sqlite/lib" CFLAGS="-std=gnu11 -I /path/to/gmp-and-sqlite/include -I . -I ccan -I external/libwally-core/src/secp256k1/include -I external/libsodium/src/libsodium/include -I external/jsmn -I external/libwally-core/include -I external/libbacktrace -I external/libbase58"
 
 The compilation will eventually fail due to a compile error in the `cdump` CCAN module. Recompile the module, and then re-run the make system.
 
     make clean -C ccan/ccan/cdump/tools
     make CC=gcc -C ccan/ccan/cdump/tools
-    BUILD=x86_64 HOST=arm-linux-gnueabihf make PIE=1 DEVELOPER=0 CONFIGURATOR_CC="arm-linux-gnueabihf-gcc -static" LDFLAGS="-L/path/to/gmp-and-sqlite/lib" CFLAGS="-std=gnu11 -I /path/to/gmp-and-sqlite/include -I . -I ccan -I external/libwally-core/src/secp256k1/include -I external/libsodium/src/libsodium/include -I external/jsmn -I external/libwally-core/include -I external/libbacktrace -I external/libbase58"
+    BUILD=x86_64 MAKE_HOST=arm-linux-gnueabihf make PIE=1 DEVELOPER=0 CONFIGURATOR_CC="arm-linux-gnueabihf-gcc -static" LDFLAGS="-L/path/to/gmp-and-sqlite/lib" CFLAGS="-std=gnu11 -I /path/to/gmp-and-sqlite/include -I . -I ccan -I external/libwally-core/src/secp256k1/include -I external/libsodium/src/libsodium/include -I external/jsmn -I external/libwally-core/include -I external/libbacktrace -I external/libbase58"
+
+To compile for Armbian
+--------------------
+For all the other Pi devices out there, consider using [Armbian](https://www.armbian.com).
+
+You can compile in `customize-image.sh` using the instructions for Ubuntu.
+
+A working example that compiles both bitcoind and c-lightning for Armbian can
+be found [here](https://github.com/Sjors/armbian-bitcoin-core).
 
 Additional steps
 --------------------

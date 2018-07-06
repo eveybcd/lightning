@@ -19,7 +19,6 @@
 #include <ccan/err/err.h>
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/mem/mem.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/time/time.h>
@@ -46,7 +45,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gossipd/gen_gossip_wire.h>
-#include <gossipd/routing.h>
+#include <gossipd/gossip_constants.h>
 #include <hsmd/gen_hsm_client_wire.h>
 #include <inttypes.h>
 #include <secp256k1.h>
@@ -96,8 +95,10 @@ struct peer {
 
 	/* BOLT #2:
 	 *
-	 * A sending node MUST set `id` to 0 for the first HTLC it offers, and
-	 * increase the value by 1 for each successive offer.
+	 * A sending node:
+	 *...
+	 *  - for the first HTLC it offers:
+	 *    - MUST set `id` to 0.
 	 */
 	u64 htlc_id;
 
@@ -160,9 +161,7 @@ struct peer {
 	u8 channel_flags;
 
 	bool announce_depth_reached;
-
-	/* Where we got up to in gossip broadcasts. */
-	u64 gossip_index;
+	bool channel_local_active;
 
 	/* Make sure timestamps move forward. */
 	u32 last_update_timestamp;
@@ -250,7 +249,7 @@ static bool peer_write_pending(struct peer *peer)
 	if (!msg)
 		return false;
 
-	status_io(LOG_IO_OUT, msg);
+	status_peer_io(LOG_IO_OUT, msg);
 	peer->peer_outmsg = cryptomsg_encrypt_msg(peer, &peer->cs, take(msg));
 	peer->peer_outoff = 0;
 	return true;
@@ -301,55 +300,53 @@ static void enqueue_peer_msg(struct peer *peer, const u8 *msg TAKES)
 	msg_enqueue(&peer->peer_out, msg);
 }
 
-static void gossip_in(struct peer *peer, const u8 *msg)
-{
-	u8 *gossip;
-	u64 gossip_index;
-
-	if (!fromwire_gossip_send_gossip(msg, msg, &gossip_index, &gossip))
-		status_failed(STATUS_FAIL_GOSSIP_IO,
-			      "Got bad message from gossipd: %s",
-			      tal_hex(msg, msg));
-
-	/* Zero is a special index meaning this is unindexed gossip. */
-	if (gossip_index != 0)
-		peer->gossip_index = gossip_index;
-
-	if (is_msg_for_gossipd(gossip))
-		enqueue_peer_msg(peer, gossip);
-	else if (fromwire_peektype(gossip) == WIRE_ERROR) {
-		struct channel_id channel_id;
-		char *what = sanitize_error(msg, msg, &channel_id);
-		peer_failed(&peer->cs, peer->gossip_index, &channel_id,
-			    "gossipd said: %s", what);
-	} else
-		status_failed(STATUS_FAIL_GOSSIP_IO,
-			      "Got bad message type %s from gossipd: %s",
-			      wire_type_name(fromwire_peektype(gossip)),
-			      tal_hex(msg, msg));
-}
-
-/* Send a temporary `channel_announcement` and `channel_update`. These
- * are unsigned and mainly used to tell gossip about the channel
- * before we have reached the `announcement_depth`, not being signed
- * means they will not be relayed, but we can already rely on them for
- * our own outgoing payments */
-static void send_temporary_announcement(struct peer *peer)
+/* Create and send channel_update to gossipd (and maybe peer) */
+static void send_channel_update(struct peer *peer, int disable_flag)
 {
 	u8 *msg;
 
-	/* If we are supposed to send a real announcement, don't do a
-	 * dummy one here, hence the check for announce_depth. */
-	if (peer->announce_depth_reached || !peer->funding_locked[LOCAL] ||
-	    !peer->funding_locked[REMOTE])
+	assert(disable_flag == 0 || disable_flag == ROUTING_FLAGS_DISABLED);
+
+	/* Only send an update if we told gossipd */
+	if (!peer->channel_local_active)
 		return;
 
-	msg = towire_gossip_local_add_channel(
-	    NULL, &peer->short_channel_ids[LOCAL], &peer->chain_hash,
-	    &peer->node_ids[REMOTE], peer->cltv_delta,
-	    peer->conf[REMOTE].htlc_minimum_msat, peer->fee_base,
-	    peer->fee_per_satoshi);
+	assert(peer->short_channel_ids[LOCAL].u64);
+
+	msg = towire_gossip_local_channel_update(NULL,
+						 &peer->short_channel_ids[LOCAL],
+						 disable_flag
+						 == ROUTING_FLAGS_DISABLED,
+						 peer->cltv_delta,
+						 peer->conf[REMOTE].htlc_minimum_msat,
+						 peer->fee_base,
+						 peer->fee_per_satoshi);
 	wire_sync_write(GOSSIP_FD, take(msg));
+}
+
+/**
+ * Add a channel locally and send a channel update to the peer
+ *
+ * Send a local_add_channel message to gossipd in order to make the channel
+ * usable locally, and also tell our peer about our parameters via a
+ * channel_update message. The peer may accept the update and use the contained
+ * information to route incoming payments through the channel. The
+ * channel_update is not preceeded by a channel_announcement and won't make much
+ * sense to other nodes, so we don't tell gossipd about it.
+ */
+static void make_channel_local_active(struct peer *peer)
+{
+	u8 *msg;
+
+	/* Tell gossipd about local channel. */
+	msg = towire_gossip_local_add_channel(NULL,
+					      &peer->short_channel_ids[LOCAL],
+					      &peer->node_ids[REMOTE]);
+ 	wire_sync_write(GOSSIP_FD, take(msg));
+
+	/* Tell gossipd and the other side what parameters we expect should
+	 * they route through us */
+	send_channel_update(peer, 0);
 }
 
 static void send_announcement_signatures(struct peer *peer)
@@ -358,17 +355,6 @@ static void send_announcement_signatures(struct peer *peer)
 	size_t offset = 258;
 	struct sha256_double hash;
 	u8 *msg, *ca, *req;
-
-	/* BOLT #7:
-	 *
-	 * If sent, `announcement_signatures` messages MUST NOT be sent until
-	 * `funding_locked` has been sent and the funding transaction has
-	 * at least 6 confirmations.
-	 */
-	/* Actually defer a bit further until both ends have signaled */
-	if (!peer->announce_depth_reached || !peer->funding_locked[LOCAL] ||
-	    !peer->funding_locked[REMOTE])
-		return;
 
 	status_trace("Exchanging announcement signatures.");
 	ca = create_channel_announcement(tmpctx, peer);
@@ -404,52 +390,11 @@ static void send_announcement_signatures(struct peer *peer)
 	sign_hash(&peer->our_secrets.funding_privkey, &hash,
 		  &peer->announcement_bitcoin_sigs[LOCAL]);
 
-	peer->have_sigs[LOCAL] = true;
-	billboard_update(peer);
-
 	msg = towire_announcement_signatures(
 	    NULL, &peer->channel_id, &peer->short_channel_ids[LOCAL],
 	    &peer->announcement_node_sigs[LOCAL],
 	    &peer->announcement_bitcoin_sigs[LOCAL]);
 	enqueue_peer_msg(peer, take(msg));
-}
-
-static u8 *create_channel_update(const tal_t *ctx,
-				 struct peer *peer, bool disabled)
-{
-	u32 timestamp = time_now().ts.tv_sec;
-	u16 flags;
-	u8 *cupdate, *msg;
-
-	/* Identical timestamps will be ignored. */
-	if (timestamp <= peer->last_update_timestamp)
-		timestamp = peer->last_update_timestamp + 1;
-	peer->last_update_timestamp = timestamp;
-
-	/* Set the signature to empty so that valgrind doesn't complain */
-	secp256k1_ecdsa_signature *sig =
-	    talz(tmpctx, secp256k1_ecdsa_signature);
-
-	flags = peer->channel_direction | (disabled << 1);
-	cupdate = towire_channel_update(
-	    tmpctx, sig, &peer->chain_hash,
-	    &peer->short_channel_ids[LOCAL], timestamp, flags,
-	    peer->cltv_delta, peer->conf[REMOTE].htlc_minimum_msat,
-	    peer->fee_base, peer->fee_per_satoshi);
-
-	msg = towire_hsm_cupdate_sig_req(tmpctx, cupdate);
-
-	if (!wire_sync_write(HSM_FD, msg))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Writing cupdate_sig_req: %s",
-			      strerror(errno));
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!msg || !fromwire_hsm_cupdate_sig_reply(ctx, msg, &cupdate))
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Reading cupdate_sig_req: %s",
-			      strerror(errno));
-	return cupdate;
 }
 
 /* Tentatively create a channel_announcement, possibly with invalid
@@ -482,58 +427,15 @@ static u8 *create_channel_announcement(const tal_t *ctx, struct peer *peer)
 	return cannounce;
 }
 
-static void handle_peer_funding_locked(struct peer *peer, const u8 *msg)
-{
-	struct channel_id chanid;
-
-	/* BOLT #2:
-	 *
-	 * On reconnection, a node MUST ignore a redundant `funding_locked` if
-	 * it receives one.
-	 */
-	if (peer->funding_locked[REMOTE])
-		return;
-
-	peer->old_remote_per_commit = peer->remote_per_commit;
-	if (!fromwire_funding_locked(msg, &chanid,
-				     &peer->remote_per_commit))
-		peer_failed(&peer->cs, peer->gossip_index,
-			    &peer->channel_id,
-			    "Bad funding_locked %s", tal_hex(msg, msg));
-
-	if (!structeq(&chanid, &peer->channel_id))
-		peer_failed(&peer->cs, peer->gossip_index,
-			    &peer->channel_id,
-			    "Wrong channel id in %s (expected %s)",
-			    tal_hex(tmpctx, msg),
-			    type_to_string(msg, struct channel_id,
-					   &peer->channel_id));
-
-	peer->funding_locked[REMOTE] = true;
-	wire_sync_write(MASTER_FD,
-			take(towire_channel_got_funding_locked(NULL,
-						&peer->remote_per_commit)));
-
-	if (peer->funding_locked[LOCAL]) {
-		wire_sync_write(MASTER_FD,
-				take(towire_channel_normal_operation(NULL)));
-	}
-	billboard_update(peer);
-
-	/* Send temporary or final announcements */
-	send_temporary_announcement(peer);
-	send_announcement_signatures(peer);
-}
-
 /* Once we have both, we'd better make sure we agree what they are! */
 static void check_short_ids_match(struct peer *peer)
 {
 	assert(peer->have_sigs[LOCAL]);
 	assert(peer->have_sigs[REMOTE]);
 
-	if (!structeq(&peer->short_channel_ids[LOCAL],
-		      &peer->short_channel_ids[REMOTE]))
-		peer_failed(&peer->cs, peer->gossip_index,
+	if (!short_channel_id_eq(&peer->short_channel_ids[LOCAL],
+				 &peer->short_channel_ids[REMOTE]))
+		peer_failed(&peer->cs,
 			    &peer->channel_id,
 			    "We disagree on short_channel_ids:"
 			    " I have %s, you say %s",
@@ -545,15 +447,88 @@ static void check_short_ids_match(struct peer *peer)
 
 static void announce_channel(struct peer *peer)
 {
-	u8 *cannounce, *cupdate;
+	u8 *cannounce;
 
 	check_short_ids_match(peer);
 
 	cannounce = create_channel_announcement(tmpctx, peer);
-	cupdate = create_channel_update(tmpctx, peer, false);
 
 	wire_sync_write(GOSSIP_FD, cannounce);
-	wire_sync_write(GOSSIP_FD, cupdate);
+	send_channel_update(peer, 0);
+}
+
+static void channel_announcement_negotiate(struct peer *peer)
+{
+	/* Don't do any announcement work if we're shutting down */
+	if (peer->shutdown_sent[LOCAL])
+		return;
+
+	/* Can't do anything until funding is locked. */
+	if (!peer->funding_locked[LOCAL] || !peer->funding_locked[REMOTE])
+		return;
+
+	if (!peer->channel_local_active) {
+		peer->channel_local_active = true;
+		make_channel_local_active(peer);
+	}
+	/* BOLT #7:
+	 *
+	 *      - MUST NOT send `announcement_signatures` messages until
+	 *      `funding_locked` has been sent AND the funding transaction has
+	 *      at least six confirmations.
+	 */
+	if (peer->announce_depth_reached && !peer->have_sigs[LOCAL]) {
+		send_announcement_signatures(peer);
+		peer->have_sigs[LOCAL] = true;
+		billboard_update(peer);
+	}
+
+	/* If we've completed the signature exchange, we can send a real
+	 * announcement, otherwise we send a temporary one */
+	if (peer->have_sigs[LOCAL] && peer->have_sigs[REMOTE])
+		announce_channel(peer);
+}
+
+static void handle_peer_funding_locked(struct peer *peer, const u8 *msg)
+{
+	struct channel_id chanid;
+
+	/* BOLT #2:
+	 *
+	 * A node:
+	 *...
+	 *  - upon reconnection:
+	 *    - MUST ignore any redundant `funding_locked` it receives.
+	 */
+	if (peer->funding_locked[REMOTE])
+		return;
+
+	/* Too late, we're shutting down! */
+	if (peer->shutdown_sent[LOCAL])
+		return;
+
+	peer->old_remote_per_commit = peer->remote_per_commit;
+	if (!fromwire_funding_locked(msg, &chanid,
+				     &peer->remote_per_commit))
+		peer_failed(&peer->cs,
+			    &peer->channel_id,
+			    "Bad funding_locked %s", tal_hex(msg, msg));
+
+	if (!channel_id_eq(&chanid, &peer->channel_id))
+		peer_failed(&peer->cs,
+			    &peer->channel_id,
+			    "Wrong channel id in %s (expected %s)",
+			    tal_hex(tmpctx, msg),
+			    type_to_string(msg, struct channel_id,
+					   &peer->channel_id));
+
+	peer->funding_locked[REMOTE] = true;
+	wire_sync_write(MASTER_FD,
+			take(towire_channel_got_funding_locked(NULL,
+						&peer->remote_per_commit)));
+
+	channel_announcement_negotiate(peer);
+	billboard_update(peer);
 }
 
 static void handle_peer_announcement_signatures(struct peer *peer, const u8 *msg)
@@ -565,14 +540,14 @@ static void handle_peer_announcement_signatures(struct peer *peer, const u8 *msg
 					      &peer->short_channel_ids[REMOTE],
 					      &peer->announcement_node_sigs[REMOTE],
 					      &peer->announcement_bitcoin_sigs[REMOTE]))
-		peer_failed(&peer->cs, peer->gossip_index,
+		peer_failed(&peer->cs,
 			    &peer->channel_id,
 			    "Bad announcement_signatures %s",
 			    tal_hex(msg, msg));
 
 	/* Make sure we agree on the channel ids */
-	if (!structeq(&chanid, &peer->channel_id)) {
-		peer_failed(&peer->cs, peer->gossip_index,
+	if (!channel_id_eq(&chanid, &peer->channel_id)) {
+		peer_failed(&peer->cs,
 			    &peer->channel_id,
 			    "Wrong channel_id: expected %s, got %s",
 			    type_to_string(tmpctx, struct channel_id,
@@ -583,9 +558,7 @@ static void handle_peer_announcement_signatures(struct peer *peer, const u8 *msg
 	peer->have_sigs[REMOTE] = true;
 	billboard_update(peer);
 
-	/* We have the remote sigs, do we have the local ones as well? */
-	if (peer->funding_locked[LOCAL] && peer->have_sigs[LOCAL])
-		announce_channel(peer);
+	channel_announcement_negotiate(peer);
 }
 
 static bool get_shared_secret(const struct htlc *htlc,
@@ -631,7 +604,6 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 				      &payment_hash, &cltv_expiry,
 				      onion_routing_packet))
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad peer_add_htlc %s", tal_hex(msg, msg));
 
@@ -640,7 +612,6 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 				   onion_routing_packet, &htlc);
 	if (add_err != CHANNEL_ERR_ADD_OK)
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad peer_add_htlc: %s",
 			    channel_add_err_name(add_err));
@@ -658,19 +629,19 @@ static void handle_peer_feechange(struct peer *peer, const u8 *msg)
 
 	if (!fromwire_update_fee(msg, &channel_id, &feerate)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fee %s", tal_hex(msg, msg));
 	}
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST fail the channel if the sender is not
-	 * responsible for paying the bitcoin fee.
+	 * A receiving node:
+	 *...
+	 *  - if the sender is not responsible for paying the Bitcoin fee:
+	 *    - MUST fail the channel.
 	 */
 	if (peer->channel->funder != REMOTE)
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "update_fee from non-funder?");
 
@@ -679,26 +650,26 @@ static void handle_peer_feechange(struct peer *peer, const u8 *msg)
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if the `update_fee` is too
-	 * low for timely processing, or unreasonably large.
+	 * A receiving node:
+	 *   - if the `update_fee` is too low for timely processing, OR is
+	 *     unreasonably large:
+	 *     - SHOULD fail the channel.
 	 */
 	if (feerate < peer->feerate_min || feerate > peer->feerate_max)
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "update_fee %u outside range %u-%u",
 			    feerate, peer->feerate_min, peer->feerate_max);
 
 	/* BOLT #2:
 	 *
-	 * A receiving node SHOULD fail the channel if the sender cannot
-	 * afford the new fee rate on the receiving node's current commitment
-	 * transaction, but it MAY delay this check until the `update_fee` is
-	 * committed.
+	 *  - if the sender cannot afford the new fee rate on the receiving
+	 *    node's current commitment transaction:
+	 *    - SHOULD fail the channel,
+	 *      - but MAY delay this check until the `update_fee` is committed.
 	 */
 	if (!channel_update_feerate(peer->channel, feerate))
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "update_fee %u unaffordable",
 			    feerate);
@@ -751,8 +722,11 @@ static bool shutdown_complete(const struct peer *peer)
 
 /* BOLT #2:
  *
- * A node MUST NOT send a `shutdown` if there are updates pending on
- * the receiving node's commitment transaction.
+ * A sending node:
+ *...
+ *  - if there are updates pending on the receiving node's commitment
+ *    transaction:
+ *     - MUST NOT send a `shutdown`.
  */
 /* So we only call this after reestablish or immediately after sending commit */
 static void maybe_send_shutdown(struct peer *peer)
@@ -764,9 +738,7 @@ static void maybe_send_shutdown(struct peer *peer)
 
 	/* Send a disable channel_update so others don't try to route
 	 * over us */
-	msg = create_channel_update(NULL, peer, true);
-	wire_sync_write(GOSSIP_FD, msg);
-	enqueue_peer_msg(peer, take(msg));
+	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 
 	msg = towire_shutdown(NULL, &peer->channel_id, peer->final_scriptpubkey);
 	enqueue_peer_msg(peer, take(msg));
@@ -883,9 +855,11 @@ static struct commit_sigs *calc_commitsigs(const tal_t *ctx,
 
 	/* BOLT #2:
 	 *
-	 * A node MUST include one `htlc_signature` for every HTLC transaction
-	 * corresponding to BIP69 lexicographic ordering of the commitment
-	 * transaction.
+	 * A sending node:
+	 *...
+	 *  - MUST include one `htlc_signature` for every HTLC transaction
+	 *    corresponding to BIP69 lexicographic ordering of the commitment
+	 *    transaction.
 	 */
 	commit_sigs->htlc_sigs = tal_arr(commit_sigs, secp256k1_ecdsa_signature,
 					 tal_count(txs) - 1);
@@ -979,8 +953,9 @@ static void send_commit(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * A node MUST NOT send a `commitment_signed` message which does not
-	 * include any updates.
+	 * A sending node:
+	 *   - MUST NOT send a `commitment_signed` message that does not include
+	 *     any updates.
 	 */
 	changed_htlcs = tal_arr(tmpctx, const struct htlc *, 0);
 	if (!channel_sending_commit(peer->channel, &changed_htlcs)) {
@@ -1175,11 +1150,11 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	if (!channel_rcvd_commit(peer->channel, &changed_htlcs)) {
 		/* BOLT #2:
 		 *
-		 * A node MUST NOT send a `commitment_signed` message which
-		 * does not include any updates.
+		 * A sending node:
+		 *   - MUST NOT send a `commitment_signed` message that does not
+		 *     include any updates.
 		 */
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "commit_sig with no changes");
 	}
@@ -1193,7 +1168,6 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	if (!fromwire_commitment_signed(tmpctx, msg,
 					&channel_id, &commit_sig, &htlc_sigs))
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad commit_sig %s", tal_hex(msg, msg));
 
@@ -1217,15 +1191,15 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 		     type_to_string(tmpctx, struct pubkey, &point));
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST fail the channel if `signature` is not valid
-	 * for its local commitment transaction once all pending updates are
-	 * applied.
+	 * A receiving node:
+	 *  - once all pending updates are applied:
+	 *    - if `signature` is not valid for its local commitment transaction:
+	 *      - MUST fail the channel.
 	 */
 	if (!check_tx_sig(txs[0], 0, NULL, wscripts[0],
 			  &peer->channel->funding_pubkey[REMOTE], &commit_sig)) {
 		dump_htlcs(peer->channel, "receiving commit_sig");
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad commit_sig signature %"PRIu64" %s for tx %s wscript %s key %s",
 			    peer->next_index[LOCAL],
@@ -1240,28 +1214,28 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST fail the channel if `num_htlcs` is not equal
-	 * to the number of HTLC outputs in the local commitment transaction
-	 * once all pending updates are applied.
+	 * A receiving node:
+	 *...
+	 *    - if `num_htlcs` is not equal to the number of HTLC outputs in the
+	 * local commitment transaction:
+	 *      - MUST fail the channel.
 	 */
 	if (tal_count(htlc_sigs) != tal_count(txs) - 1)
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Expected %zu htlc sigs, not %zu",
 			    tal_count(txs) - 1, tal_count(htlc_sigs));
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST fail
-	 * the channel if any `htlc_signature` is not valid for the
-	 * corresponding HTLC transaction.
+	 *   - if any `htlc_signature` is not valid for the corresponding HTLC
+	 *     transaction:
+	 *     - MUST fail the channel.
 	 */
 	for (i = 0; i < tal_count(htlc_sigs); i++) {
 		if (!check_tx_sig(txs[1+i], 0, NULL, wscripts[1+i],
 				  &remote_htlckey, &htlc_sigs[i]))
 			peer_failed(&peer->cs,
-				    peer->gossip_index,
 				    &peer->channel_id,
 				    "Bad commit_sig signature %s for htlc %s wscript %s key %s",
 				    type_to_string(msg, secp256k1_ecdsa_signature, &htlc_sigs[i]),
@@ -1320,35 +1294,32 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 	if (!fromwire_revoke_and_ack(msg, &channel_id, &old_commit_secret,
 				     &next_per_commit)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad revoke_and_ack %s", tal_hex(msg, msg));
 	}
 
 	if (peer->revocations_received != peer->next_index[REMOTE] - 2) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Unexpected revoke_and_ack");
 	}
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST check that `per_commitment_secret` generates
-	 * the previous `per_commitment_point`, and MUST fail if it does
-	 * not.
+	 * A receiving node:
+	 *  - if `per_commitment_secret` does not generate the previous
+	 *   `per_commitment_point`:
+	 *    - MUST fail the channel.
 	 */
 	memcpy(&privkey, &old_commit_secret, sizeof(privkey));
 	if (!pubkey_from_privkey(&privkey, &per_commit_point)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad privkey %s",
 			    type_to_string(msg, struct privkey, &privkey));
 	}
 	if (!pubkey_eq(&per_commit_point, &peer->old_remote_per_commit)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Wrong privkey %s for %"PRIu64" %s",
 			    type_to_string(msg, struct privkey, &privkey),
@@ -1393,7 +1364,6 @@ static void handle_peer_fulfill_htlc(struct peer *peer, const u8 *msg)
 	if (!fromwire_update_fulfill_htlc(msg, &channel_id,
 					  &id, &preimage)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fulfill_htlc %s", tal_hex(msg, msg));
 	}
@@ -1413,7 +1383,6 @@ static void handle_peer_fulfill_htlc(struct peer *peer, const u8 *msg)
 	case CHANNEL_ERR_HTLC_NOT_IRREVOCABLE:
 	case CHANNEL_ERR_BAD_PREIMAGE:
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fulfill_htlc: failed to fulfill %"
 			    PRIu64 " error %s", id, channel_remove_err_name(e));
@@ -1432,7 +1401,6 @@ static void handle_peer_fail_htlc(struct peer *peer, const u8 *msg)
 	if (!fromwire_update_fail_htlc(msg, msg,
 				       &channel_id, &id, &reason)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fulfill_htlc %s", tal_hex(msg, msg));
 	}
@@ -1451,7 +1419,6 @@ static void handle_peer_fail_htlc(struct peer *peer, const u8 *msg)
 	case CHANNEL_ERR_HTLC_NOT_IRREVOCABLE:
 	case CHANNEL_ERR_BAD_PREIMAGE:
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fail_htlc: failed to remove %"
 			    PRIu64 " error %s", id,
@@ -1474,7 +1441,6 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 						 &sha256_of_onion,
 						 &failure_code)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fail_malformed_htlc %s",
 			    tal_hex(msg, msg));
@@ -1482,12 +1448,12 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 
 	/* BOLT #2:
 	 *
-	 * A receiving node MUST fail the channel if the `BADONION` bit in
-	 * `failure_code` is not set for `update_fail_malformed_htlc`.
+	 *   - if the `BADONION` bit in `failure_code` is not set for
+	 *    `update_fail_malformed_htlc`:
+	 *      - MUST fail the channel.
 	 */
 	if (!(failure_code & BADONION)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fail_malformed_htlc failure code %u",
 			    failure_code);
@@ -1499,19 +1465,20 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 		/* FIXME: Do this! */
 		/* BOLT #2:
 		 *
-		 * A receiving node MAY check the `sha256_of_onion`
-		 * in `update_fail_malformed_htlc` and MAY retry or choose an
-		 * alternate error response if it does not match the onion it
-		 * sent.
+		 *   - if the `sha256_of_onion` in `update_fail_malformed_htlc`
+		 *     doesn't match the onion it sent:
+		 *    - MAY retry or choose an alternate error response.
 		 */
 
 		/* BOLT #2:
 		 *
-		 * Otherwise, a receiving node which has an outgoing HTLC
-		 * canceled by `update_fail_malformed_htlc` MUST return an
-		 * error in the `update_fail_htlc` sent to the link which
-		 * originally sent the HTLC using the `failure_code` given and
-		 * setting the data to `sha256_of_onion`.
+		 *  - otherwise, a receiving node which has an outgoing HTLC
+		 * canceled by `update_fail_malformed_htlc`:
+		 *
+		 *    - MUST return an error in the `update_fail_htlc` sent to
+		 *      the link which originally sent the HTLC, using the
+		 *      `failure_code` given and setting the data to
+		 *      `sha256_of_onion`.
 		 */
 		fail = tal_arr(htlc, u8, 0);
 		towire_u16(&fail, failure_code);
@@ -1525,7 +1492,6 @@ static void handle_peer_fail_malformed_htlc(struct peer *peer, const u8 *msg)
 	case CHANNEL_ERR_HTLC_NOT_IRREVOCABLE:
 	case CHANNEL_ERR_BAD_PREIMAGE:
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad update_fail_malformed_htlc: failed to remove %"
 			    PRIu64 " error %s", id, channel_remove_err_name(e));
@@ -1538,7 +1504,6 @@ static void handle_pong(struct peer *peer, const u8 *pong)
 	const char *err = got_pong(pong, &peer->num_pings_outstanding);
 	if (err)
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "%s", err);
 
@@ -1549,14 +1514,13 @@ static void handle_pong(struct peer *peer, const u8 *pong)
 static void handle_peer_shutdown(struct peer *peer, const u8 *shutdown)
 {
 	struct channel_id channel_id;
-	u8 *scriptpubkey, *msg;
+	u8 *scriptpubkey;
 
-	msg = create_channel_update(NULL, peer, true);
-	wire_sync_write(GOSSIP_FD, take(msg));
+	/* Disable the channel. */
+	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 
 	if (!fromwire_shutdown(peer, shutdown, &channel_id, &scriptpubkey))
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "Bad shutdown %s", tal_hex(peer, shutdown));
 
@@ -1593,7 +1557,6 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		    && type != WIRE_PONG
 		    && type != WIRE_SHUTDOWN) {
 			peer_failed(&peer->cs,
-				    peer->gossip_index,
 				    &peer->channel_id,
 				    "%s (%u) before funding locked",
 				    wire_type_name(type), type);
@@ -1648,13 +1611,17 @@ static void peer_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 	case WIRE_CHANNEL_UPDATE:
 	case WIRE_NODE_ANNOUNCEMENT:
+	case WIRE_QUERY_SHORT_CHANNEL_IDS:
+	case WIRE_QUERY_CHANNEL_RANGE:
+	case WIRE_REPLY_CHANNEL_RANGE:
+	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+	case WIRE_REPLY_SHORT_CHANNEL_IDS_END:
 	case WIRE_PING:
 	case WIRE_ERROR:
 		abort();
 	}
 
 	peer_failed(&peer->cs,
-		    peer->gossip_index,
 		    &peer->channel_id,
 		    "Peer sent unknown message %u (%s)",
 		    type, wire_type_name(type));
@@ -1663,11 +1630,7 @@ static void peer_in(struct peer *peer, const u8 *msg)
 static void peer_conn_broken(struct peer *peer)
 {
 	/* If we have signatures, send an update to say we're disabled. */
-	if (peer->have_sigs[LOCAL] && peer->have_sigs[REMOTE]) {
-		u8 *cupdate = create_channel_update(NULL, peer, true);
-
-		wire_sync_write(GOSSIP_FD, take(cupdate));
-	}
+	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 	peer_failed_connection_lost();
 }
 
@@ -1696,7 +1659,6 @@ static void send_fail_or_fulfill(struct peer *peer, const struct htlc *h)
 						 h->r);
 	} else
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "HTLC %"PRIu64" state %s not failed/fulfilled",
 			    h->id, htlc_state_name(h->state));
@@ -1711,10 +1673,11 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 
 	/* BOLT #2:
 	 *
-	 * If `next_local_commitment_number` is equal to the commitment number
-	 * of the last `commitment_signed` message the receiving node has
-	 * sent, it MUST reuse the same commitment number for its next
-	 * `commitment_signed`
+	 *   - if `next_local_commitment_number` is equal to the commitment
+	 *     number of the last `commitment_signed` message the receiving node
+	 *     has sent:
+	 *     - MUST reuse the same commitment number for its next
+	 *       `commitment_signed`.
 	 */
 	/* In our case, we consider ourselves already committed to this, so
 	 * retransmission is simplest. */
@@ -1729,7 +1692,6 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 		 * then they asked for a retransmit */
 		if (!h)
 			peer_failed(&peer->cs,
-				    peer->gossip_index,
 				    &peer->channel_id,
 				    "Can't find HTLC %"PRIu64" to resend",
 				    last[i].id);
@@ -1762,7 +1724,13 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 	enqueue_peer_msg(peer, take(msg));
 	tal_free(commit_sigs);
 
-	assert(peer->revocations_received == peer->next_index[REMOTE] - 2);
+	/* If we have already received the revocation for the previous, the
+	 * other side shouldn't be asking for a retransmit! */
+	if (peer->revocations_received != peer->next_index[REMOTE] - 2)
+		status_unusual("Retransmitted commitment_signed %"PRIu64
+			       " but they already send revocation %"PRIu64"?",
+			       peer->next_index[REMOTE]-1,
+			       peer->revocations_received);
 }
 
 /* Our local wrapper around read_peer_msg */
@@ -1782,7 +1750,7 @@ static bool channeld_send_reply(struct crypto_state *cs UNUSED,
 
 static u8 *channeld_read_peer_msg(struct peer *peer)
 {
-	return read_peer_msg(peer, &peer->cs, peer->gossip_index,
+	return read_peer_msg(peer, &peer->cs,
 			     &peer->channel_id,
 			     channeld_send_reply,
 			     channeld_io_error,
@@ -1797,20 +1765,24 @@ static void peer_reconnect(struct peer *peer)
 	bool retransmit_revoke_and_ack;
 	struct htlc_map_iter it;
 	const struct htlc *htlc;
-	u8 *msg, *cupdate;
+	u8 *msg;
 
 	/* BOLT #2:
 	 *
-	 * On reconnection, a node MUST transmit `channel_reestablish` for
-	 * each channel, and MUST wait for to receive the other node's
-	 * `channel_reestablish` message before sending any other messages for
-	 * that channel.
+	 *   - upon reconnection:
+	 *     - if a channel is in an error state:
+	 *       - SHOULD retransmit the error packet and ignore any other packets for
+	 *        that channel.
+	 *     - otherwise:
+	 *       - MUST transmit `channel_reestablish` for each channel.
+	 *       - MUST wait to receive the other node's `channel_reestablish`
+	 *         message before sending any other messages for that channel.
 	 *
-	 * The sending node MUST set `next_local_commitment_number` to the
-	 * commitment number of the next `commitment_signed` it expects to
-	 * receive, and MUST set `next_remote_revocation_number` to the
-	 * commitment number of the next `revoke_and_ack` message it expects
-	 * to receive.
+	 * The sending node:
+	 *   - MUST set `next_local_commitment_number` to the commitment number
+	 *     of the next `commitment_signed` it expects to receive.
+	 *   - MUST set `next_remote_revocation_number` to the commitment number
+	 *     of the next `revoke_and_ack` message it expects to receive.
 	 */
 	msg = towire_channel_reestablish(NULL, &peer->channel_id,
 					 peer->next_index[LOCAL],
@@ -1828,7 +1800,6 @@ static void peer_reconnect(struct peer *peer)
 					  &next_local_commitment_number,
 					  &next_remote_revocation_number)) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "bad reestablish msg: %s %s",
 			    wire_type_name(fromwire_peektype(msg)),
@@ -1841,9 +1812,11 @@ static void peer_reconnect(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * If `next_local_commitment_number` is 1 in both the
-	 * `channel_reestablish` it sent and received, then the node MUST
-	 * retransmit `funding_locked`, otherwise it MUST NOT.
+	 *   - if `next_local_commitment_number` is 1 in both the
+	 *    `channel_reestablish` it sent and received:
+	 *     - MUST retransmit `funding_locked`.
+	 *   - otherwise:
+	 *     - MUST NOT retransmit `funding_locked`.
 	 */
 	if (peer->funding_locked[LOCAL]
 	    && peer->next_index[LOCAL] == 1
@@ -1865,19 +1838,21 @@ static void peer_reconnect(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * If `next_remote_revocation_number` is equal to the commitment
-	 * number of the last `revoke_and_ack` the receiving node has sent and the receiving node has not already received a `closing_signed`, it
-	 * MUST re-send the `revoke_and_ack`, otherwise if
-	 * `next_remote_revocation_number` is not equal to one greater than
-	 * the commitment number of the last `revoke_and_ack` the receiving
-	 * node has sent (or equal to zero if none have been sent), it SHOULD
-	 * fail the channel.
+	 *   - if `next_local_commitment_number` is equal to the commitment
+	 *     number of the last `commitment_signed` message the receiving node
+	 *     has sent:
+	 *     - MUST reuse the same commitment number for its next
+	 *      `commitment_signed`.
+	 *   - otherwise:
+	 *     - if `next_local_commitment_number` is not 1 greater than the
+	 *       commitment number of the last `commitment_signed` message the
+	 *       receiving node has sent:
+	 *       - SHOULD fail the channel.
 	 */
 	if (next_remote_revocation_number == peer->next_index[LOCAL] - 2) {
 		/* Don't try to retransmit revocation index -1! */
 		if (peer->next_index[LOCAL] < 2) {
 			peer_failed(&peer->cs,
-				    peer->gossip_index,
 				    &peer->channel_id,
 				    "bad reestablish revocation_number: %"
 				    PRIu64,
@@ -1886,7 +1861,6 @@ static void peer_reconnect(struct peer *peer)
 		retransmit_revoke_and_ack = true;
 	} else if (next_remote_revocation_number != peer->next_index[LOCAL] - 1) {
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "bad reestablish revocation_number: %"PRIu64
 			    " vs %"PRIu64,
@@ -1902,16 +1876,16 @@ static void peer_reconnect(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * If `next_local_commitment_number` is equal to the commitment number
-	 * of the last `commitment_signed` message the receiving node has
-	 * sent, it MUST reuse the same commitment number for its next
-	 * `commitment_signed`
+	 *   - if `next_local_commitment_number` is equal to the commitment
+	 *     number of the last `commitment_signed` message the receiving node
+	 *     has sent:
+	 *     - MUST reuse the same commitment number for its next
+	 *       `commitment_signed`.
 	 */
 	if (next_local_commitment_number == peer->next_index[REMOTE] - 1) {
 		/* We completed opening, we don't re-transmit that one! */
 		if (next_local_commitment_number == 0)
 			peer_failed(&peer->cs,
-				    peer->gossip_index,
 				    &peer->channel_id,
 				    "bad reestablish commitment_number: %"
 				    PRIu64,
@@ -1921,13 +1895,14 @@ static void peer_reconnect(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * ... otherwise if `next_local_commitment_number` is not one greater
-	 * than the commitment number of the last `commitment_signed` message
-	 * the receiving node has sent, it SHOULD fail the channel.
+	 *   - otherwise:
+	 *     - if `next_local_commitment_number` is not 1 greater than the
+	 *       commitment number of the last `commitment_signed` message the
+	 *       receiving node has sent:
+	 *       - SHOULD fail the channel.
 	 */
 	} else if (next_local_commitment_number != peer->next_index[REMOTE])
 		peer_failed(&peer->cs,
-			    peer->gossip_index,
 			    &peer->channel_id,
 			    "bad reestablish commitment_number: %"PRIu64
 			    " vs %"PRIu64,
@@ -1940,11 +1915,11 @@ static void peer_reconnect(struct peer *peer)
 
 	/* BOLT #2:
 	 *
-	 * On reconnection if the node has sent a previous `closing_signed` it
-	 * MUST send another `closing_signed`, otherwise if the node has sent
-	 * a previous `shutdown` it MUST retransmit it.
+	 *   - upon reconnection:
+	 *     - if it has sent a previous `shutdown`:
+	 *       - MUST retransmit `shutdown`.
 	 */
-	/* If we had sent `closing_signed`, we'd be in closingd. */
+	/* (If we had sent `closing_signed`, we'd be in closingd). */
 	maybe_send_shutdown(peer);
 
 	/* Corner case: we didn't send shutdown before because update_add_htlc
@@ -1964,9 +1939,7 @@ static void peer_reconnect(struct peer *peer)
 
 	/* Reenable channel by sending a channel_update without the
 	 * disable flag */
-	cupdate = create_channel_update(NULL, peer, false);
-	wire_sync_write(GOSSIP_FD, cupdate);
-	enqueue_peer_msg(peer, take(cupdate));
+	channel_announcement_negotiate(peer);
 
 	/* Corner case: we will get upset with them if they send
 	 * commitment_signed with no changes.  But it could be that we sent a
@@ -1980,45 +1953,42 @@ static void peer_reconnect(struct peer *peer)
 	peer_billboard(true, "Reconnected, and reestablished.");
 }
 
+/* Funding has locked in, and reached depth. */
 static void handle_funding_locked(struct peer *peer, const u8 *msg)
 {
-	struct pubkey next_per_commit_point;
+	unsigned int depth;
 
 	if (!fromwire_channel_funding_locked(msg,
-					     &peer->short_channel_ids[LOCAL]))
+					     &peer->short_channel_ids[LOCAL],
+					     &depth))
 		master_badmsg(WIRE_CHANNEL_FUNDING_LOCKED, msg);
 
-	per_commit_point(&peer->shaseed,
-			 &next_per_commit_point, peer->next_index[LOCAL]);
+	/* Too late, we're shutting down! */
+	if (peer->shutdown_sent[LOCAL])
+		return;
 
-	status_trace("funding_locked: sending commit index %"PRIu64": %s",
-		     peer->next_index[LOCAL],
-		     type_to_string(tmpctx, struct pubkey, &next_per_commit_point));
-	msg = towire_funding_locked(NULL,
-				    &peer->channel_id, &next_per_commit_point);
-	enqueue_peer_msg(peer, take(msg));
-	peer->funding_locked[LOCAL] = true;
+	if (!peer->funding_locked[LOCAL]) {
+		struct pubkey next_per_commit_point;
 
-	if (peer->funding_locked[REMOTE]) {
-		wire_sync_write(MASTER_FD,
-				take(towire_channel_normal_operation(NULL)));
+		per_commit_point(&peer->shaseed,
+				 &next_per_commit_point,
+				 peer->next_index[LOCAL]);
+
+		status_trace("funding_locked: sending commit index %"PRIu64": %s",
+			     peer->next_index[LOCAL],
+			     type_to_string(tmpctx, struct pubkey, &next_per_commit_point));
+		msg = towire_funding_locked(NULL,
+					    &peer->channel_id, &next_per_commit_point);
+		enqueue_peer_msg(peer, take(msg));
+		peer->funding_locked[LOCAL] = true;
 	}
-	billboard_update(peer);
+
+	peer->announce_depth_reached = (depth >= ANNOUNCE_MIN_DEPTH);
 
 	/* Send temporary or final announcements */
-	send_temporary_announcement(peer);
-	send_announcement_signatures(peer);
-}
+	channel_announcement_negotiate(peer);
 
-static void handle_funding_announce_depth(struct peer *peer)
-{
-	peer->announce_depth_reached = true;
-	send_announcement_signatures(peer);
-
-	/* Only send the announcement and update if the other end gave
-	 * us its sig */
-	if (peer->have_sigs[REMOTE])
-		announce_channel(peer);
+	billboard_update(peer);
 }
 
 static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
@@ -2114,18 +2084,19 @@ static void handle_feerates(struct peer *peer, const u8 *inmsg)
 
 	/* BOLT #2:
 	 *
-	 * The node which is responsible for paying the bitcoin fee SHOULD
-	 * send `update_fee` to ensure the current fee rate is sufficient for
-	 * timely processing of the commitment transaction by a significant
-	 * margin. */
+	 * The node _responsible_ for paying the Bitcoin fee:
+	 *   - SHOULD send `update_fee` to ensure the current fee rate is
+	 *    sufficient (by a significant margin) for timely processing of the
+	 *     commitment transaction.
+	 */
 	if (peer->channel->funder == LOCAL) {
 		peer->desired_feerate = feerate;
 		start_commit_timer(peer);
 	} else {
 		/* BOLT #2:
 		 *
-		 * The node which is not responsible for paying the bitcoin
-		 * fee MUST NOT send `update_fee`.
+		 * The node _not responsible_ for paying the Bitcoin fee:
+		 *  - MUST NOT send `update_fee`.
 		 */
 		/* FIXME: We could drop to chain if fees are too low, but
 		 * that's fraught too. */
@@ -2348,9 +2319,11 @@ static void handle_ping_cmd(struct peer *peer, const u8 *inmsg)
 
 	/* BOLT #1:
 	 *
-	 * if `num_pong_bytes` is less than 65532 it MUST respond by sending a
-	 * `pong` message with `byteslen` equal to `num_pong_bytes`, otherwise
-	 * it MUST ignore the `ping`.
+	 *   - if `num_pong_bytes` is less than 65532:
+	 *     - MUST respond by sending a `pong` message, with `byteslen` equal
+	 *       to `num_pong_bytes`.
+	 *   - otherwise (`num_pong_bytes` is **not** less than 65532):
+	 *     - MUST ignore the `ping`.
 	 */
 	if (num_pong_bytes >= 65532)
 		wire_sync_write(MASTER_FD,
@@ -2388,9 +2361,6 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_FUNDING_LOCKED:
 		handle_funding_locked(peer, msg);
 		return;
-	case WIRE_CHANNEL_FUNDING_ANNOUNCE_DEPTH:
-		handle_funding_announce_depth(peer);
-		return;
 	case WIRE_CHANNEL_OFFER_HTLC:
 		handle_offer_htlc(peer, msg);
 		return;
@@ -2414,7 +2384,6 @@ static void req_in(struct peer *peer, const u8 *msg)
 		handle_dev_reenable_commit(peer);
 		return;
 #endif /* DEVELOPER */
-	case WIRE_CHANNEL_NORMAL_OPERATION:
 	case WIRE_CHANNEL_INIT:
 	case WIRE_CHANNEL_OFFER_HTLC_REPLY:
 	case WIRE_CHANNEL_PING_REPLY:
@@ -2486,7 +2455,6 @@ static void init_channel(struct peer *peer)
 				   &peer->feerate_min, &peer->feerate_max,
 				   &peer->their_commit_sig,
 				   &peer->cs,
-				   &peer->gossip_index,
 				   &funding_pubkey[REMOTE],
 				   &points[REMOTE].revocation,
 				   &points[REMOTE].payment,
@@ -2523,7 +2491,8 @@ static void init_channel(struct peer *peer)
 				   &peer->shutdown_sent[REMOTE],
 				   &peer->final_scriptpubkey,
 				   &peer->channel_flags,
-				   &funding_signed))
+				   &funding_signed,
+				   &peer->announce_depth_reached))
 		master_badmsg(WIRE_CHANNEL_INIT, msg);
 
 	status_trace("init %s: remote_per_commit = %s, old_remote_per_commit = %s"
@@ -2590,6 +2559,8 @@ static void init_channel(struct peer *peer)
 	if (funding_signed)
 		enqueue_peer_msg(peer, take(funding_signed));
 
+	channel_announcement_negotiate(peer);
+
 	billboard_update(peer);
 	tal_free(msg);
 }
@@ -2601,9 +2572,7 @@ static void send_shutdown_complete(struct peer *peer)
 
 	/* Now we can tell master shutdown is complete. */
 	wire_sync_write(MASTER_FD,
-			take(towire_channel_shutdown_complete(NULL,
-							      &peer->cs,
-							      peer->gossip_index)));
+			take(towire_channel_shutdown_complete(NULL, &peer->cs)));
 	fdpass_send(MASTER_FD, PEER_FD);
 	fdpass_send(MASTER_FD, GOSSIP_FD);
 	close(MASTER_FD);
@@ -2611,6 +2580,8 @@ static void send_shutdown_complete(struct peer *peer)
 
 int main(int argc, char *argv[])
 {
+	setup_locale();
+
 	int i, nfds;
 	fd_set fds_in, fds_out;
 	struct peer *peer;
@@ -2623,6 +2594,7 @@ int main(int argc, char *argv[])
 	peer->commit_timer = NULL;
 	peer->have_sigs[LOCAL] = peer->have_sigs[REMOTE] = false;
 	peer->announce_depth_reached = false;
+	peer->channel_local_active = false;
 	msg_queue_init(&peer->from_master, peer);
 	msg_queue_init(&peer->from_gossipd, peer);
 	msg_queue_init(&peer->peer_out, peer);
@@ -2685,8 +2657,10 @@ int main(int argc, char *argv[])
 		if (msg) {
 			status_trace("Now dealing with deferred gossip %u",
 				     fromwire_peektype(msg));
-			gossip_in(peer, msg);
-			tal_free(msg);
+			handle_gossip_msg(take(msg), &peer->cs,
+					  channeld_send_reply,
+					  channeld_io_error,
+					  peer);
 			continue;
 		}
 
@@ -2735,12 +2709,14 @@ int main(int argc, char *argv[])
 			req_in(peer, msg);
 		} else if (FD_ISSET(GOSSIP_FD, &rfds)) {
 			msg = wire_sync_read(peer, GOSSIP_FD);
-
+			/* Gossipd hangs up on us to kill us when a new
+			 * connection comes in. */
 			if (!msg)
-				status_failed(STATUS_FAIL_GOSSIP_IO,
-					      "Can't read command: %s",
-					      strerror(errno));
-			gossip_in(peer, msg);
+				peer_conn_broken(peer);
+			handle_gossip_msg(msg, &peer->cs,
+					  channeld_send_reply,
+					  channeld_io_error,
+					  peer);
 		} else if (FD_ISSET(PEER_FD, &rfds)) {
 			/* This could take forever, but who cares? */
 			msg = channeld_read_peer_msg(peer);

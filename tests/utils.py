@@ -1,4 +1,3 @@
-import binascii
 import logging
 import os
 import re
@@ -8,30 +7,46 @@ import threading
 import time
 
 from bitcoin.rpc import RawProxy as BitcoinProxy
+from decimal import Decimal
+from ephemeral_port_reserve import reserve
 
 
 BITCOIND_CONFIG = {
+    "regtest": 1,
     "rpcuser": "rpcuser",
     "rpcpassword": "rpcpass",
-    "rpcport": 18332,
 }
 
 
 LIGHTNINGD_CONFIG = {
-    "bitcoind-poll": "1s",
     "log-level": "debug",
     "cltv-delta": 6,
     "cltv-final": 5,
-    "locktime-blocks": 5,
+    "watchtime-blocks": 5,
+    "rescan": 1,
+    'disable-dns': None,
 }
 
 DEVELOPER = os.getenv("DEVELOPER", "0") == "1"
+TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 
 
-def write_config(filename, opts):
+def wait_for(success, timeout=TIMEOUT, interval=0.1):
+    start_time = time.time()
+    while not success() and time.time() < start_time + timeout:
+        time.sleep(interval)
+    if time.time() > start_time + timeout:
+        raise ValueError("Error waiting for {}", success)
+
+
+def write_config(filename, opts, regtest_opts=None):
     with open(filename, 'w') as f:
         for k, v in opts.items():
             f.write("{}={}\n".format(k, v))
+        if regtest_opts:
+            f.write("[regtest]\n")
+            for k, v in regtest_opts.items():
+                f.write("{}={}\n".format(k, v))
 
 
 class TailableProc(object):
@@ -41,7 +56,7 @@ class TailableProc(object):
     tail the processes and react to their output.
     """
 
-    def __init__(self, outputDir=None):
+    def __init__(self, outputDir=None, verbose=True):
         self.logs = []
         self.logs_cond = threading.Condition(threading.RLock())
         self.env = os.environ
@@ -49,6 +64,13 @@ class TailableProc(object):
         self.proc = None
         self.outputDir = outputDir
         self.logsearch_start = 0
+
+        # Should we be logging lines we read from stdout?
+        self.verbose = verbose
+
+        # A filter function that'll tell us whether to filter out the line (not
+        # pass it to the log matcher and not print it to stdout).
+        self.log_filter = lambda line: False
 
     def start(self):
         """Start the underlying process and start monitoring it.
@@ -101,9 +123,12 @@ class TailableProc(object):
         for line in iter(self.proc.stdout.readline, ''):
             if len(line) == 0:
                 break
+            if self.log_filter(line.decode('ASCII')):
+                continue
+            if self.verbose:
+                logging.debug("%s: %s", self.prefix, line.decode().rstrip())
             with self.logs_cond:
                 self.logs.append(str(line.rstrip()))
-                logging.debug("%s: %s", self.prefix, line.decode().rstrip())
                 self.logs_cond.notifyAll()
         self.running = False
         self.proc.stdout.close()
@@ -120,7 +145,7 @@ class TailableProc(object):
         logging.debug("Did not find '%s' in logs", regex)
         return None
 
-    def wait_for_logs(self, regexs, timeout=60):
+    def wait_for_logs(self, regexs, timeout=TIMEOUT):
         """Look for `regexs` in the logs.
 
         We tail the stdout of the process and look for each regex in `regexs`,
@@ -159,7 +184,7 @@ class TailableProc(object):
                     return self.logs[pos]
                 pos += 1
 
-    def wait_for_log(self, regex, timeout=60):
+    def wait_for_log(self, regex, timeout=TIMEOUT):
         """Look for `regex` in the logs.
 
         Convenience wrapper for the common case of only seeking a single entry.
@@ -196,8 +221,11 @@ class SimpleBitcoinProxy:
 
 class BitcoinD(TailableProc):
 
-    def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=18332):
-        TailableProc.__init__(self, bitcoin_dir)
+    def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
+        TailableProc.__init__(self, bitcoin_dir, verbose=False)
+
+        if rpcport is None:
+            rpcport = reserve()
 
         self.bitcoin_dir = bitcoin_dir
         self.rpcport = rpcport
@@ -212,19 +240,21 @@ class BitcoinD(TailableProc):
             '-datadir={}'.format(bitcoin_dir),
             '-printtoconsole',
             '-server',
-            '-regtest',
             '-logtimestamps',
             '-nolisten',
         ]
+        # For up to and including 0.16.1, this needs to be in main section.
         BITCOIND_CONFIG['rpcport'] = rpcport
-        btc_conf_file = os.path.join(regtestdir, 'bitcoin.conf')
-        write_config(os.path.join(bitcoin_dir, 'bitcoin.conf'), BITCOIND_CONFIG)
-        write_config(btc_conf_file, BITCOIND_CONFIG)
+        # For after 0.16.1 (eg. 3f398d7a17f136cd4a67998406ca41a124ae2966), this
+        # needs its own [regtest] section.
+        BITCOIND_REGTEST = {'rpcport': rpcport}
+        btc_conf_file = os.path.join(bitcoin_dir, 'bitcoin.conf')
+        write_config(btc_conf_file, BITCOIND_CONFIG, BITCOIND_REGTEST)
         self.rpc = SimpleBitcoinProxy(btc_conf_file=btc_conf_file)
 
     def start(self):
         TailableProc.start(self)
-        self.wait_for_log("Done loading", timeout=60)
+        self.wait_for_log("Done loading", timeout=TIMEOUT)
 
         logging.info("BitcoinD started")
 
@@ -232,15 +262,9 @@ class BitcoinD(TailableProc):
         # As of 0.16, generate() is removed; use generatetoaddress.
         self.rpc.generatetoaddress(numblocks, self.rpc.getnewaddress())
 
-# lightning-1 => 0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518 aka JUNIORBEAM #0266e4
-# lightning-2 => 022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59 aka SILENTARTIST #022d22
-# lightning-3 => 035d2b1192dfba134e10e540875d366ebc8bc353d5aa766b80c090b39c3a5d885d aka HOPPINGFIRE #035d2b
-# lightning-4 => 0382ce59ebf18be7d84677c2e35f23294b9992ceca95491fcf8a56c6cb2d9de199 aka JUNIORFELONY #0382ce
-# lightning-5 => 032cf15d1ad9c4a08d26eab1918f732d8ef8fdc6abb9640bf3db174372c491304e aka SOMBERFIRE #032cf1
-
 
 class LightningD(TailableProc):
-    def __init__(self, lightning_dir, bitcoin_dir, port=9735, random_hsm=False):
+    def __init__(self, lightning_dir, bitcoin_dir, port=9735, random_hsm=False, node_id=0):
         TailableProc.__init__(self, lightning_dir)
         self.lightning_dir = lightning_dir
         self.port = port
@@ -250,9 +274,9 @@ class LightningD(TailableProc):
         opts = {
             'bitcoin-datadir': bitcoin_dir,
             'lightning-dir': lightning_dir,
-            'port': port,
+            'addr': '127.0.0.1:{}'.format(port),
             'allow-deprecated-apis': 'false',
-            'override-fee-rates': '15000/7500/1000',
+            'default-fee-rate': 15000,
             'network': 'regtest',
             'ignore-fee-limits': 'false',
         }
@@ -260,16 +284,30 @@ class LightningD(TailableProc):
         for k, v in opts.items():
             self.opts[k] = v
 
-        # Last 32-bytes of final part of dir -> seed.
-        seed = (bytes(re.search('([^/]+)/*$', lightning_dir).group(1), encoding='utf-8') + bytes(32))[:32]
-        if DEVELOPER:
-            self.opts['dev-broadcast-interval'] = 1000
-            if not random_hsm:
-                self.opts['dev-hsm-seed'] = binascii.hexlify(seed).decode('ascii')
-        self.prefix = 'lightningd(%d)' % (port)
-
         if not os.path.exists(lightning_dir):
             os.makedirs(lightning_dir)
+
+        # Last 32-bytes of final part of dir -> seed.
+        seed = (bytes(re.search('([^/]+)/*$', lightning_dir).group(1), encoding='utf-8') + bytes(32))[:32]
+        if not random_hsm:
+            with open(os.path.join(lightning_dir, 'hsm_secret'), 'wb') as f:
+                f.write(seed)
+        if DEVELOPER:
+            self.opts['dev-broadcast-interval'] = 1000
+            self.opts['dev-bitcoind-poll'] = 1
+            # lightningd won't announce non-routable addresses by default.
+            self.opts['dev-allow-localhost'] = None
+        self.prefix = 'lightningd-%d' % (node_id)
+
+        filters = [
+            "Unable to estimate",
+            "No fee estimate",
+            "Connected json input",
+            "Forcing fee rate, ignoring estimate",
+        ]
+
+        filter_re = re.compile(r'({})'.format("|".join(filters)))
+        self.log_filter = lambda line: filter_re.search(line) is not None
 
     @property
     def cmd_line(self):
@@ -278,6 +316,9 @@ class LightningD(TailableProc):
         for k, v in sorted(self.opts.items()):
             if v is None:
                 opts.append("--{}".format(k))
+            elif isinstance(v, list):
+                for i in v:
+                    opts.append("--{}={}".format(k, i))
             else:
                 opts.append("--{}={}".format(k, v))
 
@@ -299,57 +340,30 @@ class LightningD(TailableProc):
 
 
 class LightningNode(object):
-    def __init__(self, daemon, rpc, btc, executor, may_fail=False):
+    def __init__(self, daemon, rpc, btc, executor, may_fail=False, may_reconnect=False):
         self.rpc = rpc
         self.daemon = daemon
         self.bitcoin = btc
         self.executor = executor
         self.may_fail = may_fail
+        self.may_reconnect = may_reconnect
 
-    # Use batch if you're doing more than one async.
-    def connect(self, remote_node, capacity, async=False):
-        # Collect necessary information
-        addr = self.rpc.newaddr()['address']
-        txid = self.bitcoin.rpc.sendtoaddress(addr, capacity)
-        tx = self.bitcoin.rpc.gettransaction(txid)
-        start_size = self.bitcoin.rpc.getmempoolinfo()['size']
-
-        def call_connect():
-            try:
-                self.rpc.connect('127.0.0.1', remote_node.daemon.port, tx['hex'], async=False)
-            except Exception:
-                pass
-        t = threading.Thread(target=call_connect)
-        t.daemon = True
-        t.start()
-
-        def wait_connected():
-            # Up to 10 seconds to get tx into mempool.
-            start_time = time.time()
-            while self.bitcoin.rpc.getmempoolinfo()['size'] == start_size:
-                if time.time() > start_time + 10:
-                    raise TimeoutError('No new transactions in mempool')
-                time.sleep(0.1)
-
-            self.bitcoin.generate_block(1)
-
-            # fut.result(timeout=5)
-
-            # Now wait for confirmation
-            self.daemon.wait_for_log(" to CHANNELD_NORMAL|STATE_NORMAL")
-            remote_node.daemon.wait_for_log(" to CHANNELD_NORMAL|STATE_NORMAL")
-
-        if async:
-            return self.executor.submit(wait_connected)
-        else:
-            return wait_connected()
-
-    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit"):
+    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, announce=True):
         addr, wallettxid = self.fundwallet(capacity, addrtype)
         fundingtx = self.rpc.fundchannel(remote_node.info['id'], capacity)
-        self.daemon.wait_for_log('sendrawtx exit 0, gave')
-        self.bitcoin.generate_block(6)
-        self.daemon.wait_for_log('to CHANNELD_NORMAL|STATE_NORMAL')
+
+        # Wait for the funding transaction to be in bitcoind's mempool
+        wait_for(lambda: fundingtx['txid'] in self.bitcoin.rpc.getrawmempool())
+
+        if confirm or announce:
+            self.bitcoin.generate_block(1)
+
+        if announce:
+            self.bitcoin.generate_block(5)
+
+        if confirm or announce:
+            self.daemon.wait_for_log(
+                r'Funding tx {} depth'.format(fundingtx['txid']))
         return {'address': addr, 'wallettxid': wallettxid, 'fundingtx': fundingtx}
 
     def fundwallet(self, sats, addrtype="p2sh-segwit"):
@@ -392,6 +406,11 @@ class LightningNode(object):
         c.close()
         db.close()
 
+    def start(self):
+        self.daemon.start()
+        # This shortcut is sufficient for our simple tests.
+        self.port = self.rpc.getinfo()['binding'][0]['port']
+
     def stop(self, timeout=10):
         """ Attempt to do a clean shutdown, but kill if it hangs
         """
@@ -428,4 +447,53 @@ class LightningNode(object):
         else:
             self.daemon.stop()
 
-        self.daemon.start()
+        self.start()
+
+    def fund_channel(self, l2, amount):
+
+        # Give yourself some funds to work with
+        addr = self.rpc.newaddr()['address']
+        self.bitcoin.rpc.sendtoaddress(addr, (amount + 1000000) / 10**8)
+        numfunds = len(self.rpc.listfunds()['outputs'])
+        self.bitcoin.generate_block(1)
+        wait_for(lambda: len(self.rpc.listfunds()['outputs']) > numfunds)
+
+        # Now go ahead and open a channel
+        num_tx = len(self.bitcoin.rpc.getrawmempool())
+        tx = self.rpc.fundchannel(l2.info['id'], amount)['tx']
+
+        wait_for(lambda: len(self.bitcoin.rpc.getrawmempool()) == num_tx + 1)
+        self.bitcoin.generate_block(1)
+        # We wait until gossipd sees local update, as well as status NORMAL,
+        # so it can definitely route through.
+        self.daemon.wait_for_logs(['update for channel .* now ACTIVE', 'to CHANNELD_NORMAL'])
+        l2.daemon.wait_for_logs(['update for channel .* now ACTIVE', 'to CHANNELD_NORMAL'])
+
+        # Hacky way to find our output.
+        decoded = self.bitcoin.rpc.decoderawtransaction(tx)
+        for out in decoded['vout']:
+            # Sometimes a float?  Sometimes a decimal?  WTF Python?!
+            if out['scriptPubKey']['type'] == 'witness_v0_scripthash':
+                if out['value'] == Decimal(amount) / 10**8 or out['value'] * 10**8 == amount:
+                    return "{}:1:{}".format(self.bitcoin.rpc.getblockcount(), out['n'])
+        # Intermittent decoding failure.  See if it decodes badly twice?
+        decoded2 = self.bitcoin.rpc.decoderawtransaction(tx)
+        raise ValueError("Can't find {} payment in {} (1={} 2={})".format(amount, tx, decoded, decoded2))
+
+    def subd_pid(self, subd):
+        """Get the process id of the given subdaemon, eg channeld or gossipd"""
+        ex = re.compile(r'lightning_{}.*: pid ([0-9]*),'.format(subd))
+        # Make sure we get latest one if it's restarted!
+        for l in reversed(self.daemon.logs):
+            group = ex.search(l)
+            if group:
+                return group.group(1)
+        raise ValueError("No daemon {} found".format(subd))
+
+    def is_channel_active(self, chanid):
+        channels = self.rpc.listchannels()['channels']
+        active = [(c['short_channel_id'], c['flags']) for c in channels if c['active']]
+        return (chanid, 0) in active and (chanid, 1) in active
+
+    def wait_channel_active(self, chanid):
+        wait_for(lambda: self.is_channel_active(chanid), interval=1)

@@ -9,7 +9,6 @@ opening_init,,our_config,struct channel_config
 opening_init,,max_to_self_delay,u32
 opening_init,,min_effective_htlc_capacity_msat,u64
 opening_init,,crypto_state,struct crypto_state
-opening_init,,gossip_index,u64
 # Seed to generate all the keys from
 opening_init,,seed,struct privkey
 
@@ -20,7 +19,6 @@ opening_funder,6001
 opening_funder,,funding_satoshis,u64
 opening_funder,,push_msat,u64
 opening_funder,,feerate_per_kw,u32
-opening_funder,,max_minimum_depth,u32
 opening_funder,,change_satoshis,u64
 opening_funder,,change_keyindex,u32
 opening_funder,,channel_flags,u8
@@ -35,7 +33,6 @@ opening_funder_reply,,their_config,struct channel_config
 opening_funder_reply,,first_commit,struct bitcoin_tx
 opening_funder_reply,,first_commit_sig,secp256k1_ecdsa_signature
 opening_funder_reply,,crypto_state,struct crypto_state
-opening_funder_reply,,gossip_index,u64
 opening_funder_reply,,revocation_basepoint,struct pubkey
 opening_funder_reply,,payment_basepoint,struct pubkey
 opening_funder_reply,,htlc_basepoint,struct pubkey
@@ -60,7 +57,6 @@ opening_fundee_reply,,their_config,struct channel_config
 opening_fundee_reply,,first_commit,struct bitcoin_tx
 opening_fundee_reply,,first_commit_sig,secp256k1_ecdsa_signature
 opening_fundee_reply,,crypto_state,struct crypto_state
-opening_fundee_reply,,gossip_index,u64
 opening_fundee_reply,,revocation_basepoint,struct pubkey
 opening_fundee_reply,,payment_basepoint,struct pubkey
 opening_fundee_reply,,htlc_basepoint,struct pubkey

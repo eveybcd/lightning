@@ -2,6 +2,7 @@
 #include "peer_control.h"
 #include "subd.h"
 #include <arpa/inet.h>
+#include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
@@ -26,7 +27,6 @@
 #include <hsmd/gen_hsm_client_wire.h>
 #include <inttypes.h>
 #include <lightningd/bitcoind.h>
-#include <lightningd/build_utxos.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/closing_control.h>
@@ -34,8 +34,8 @@
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
-#include <lightningd/netaddress.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/opening_control.h>
 #include <lightningd/options.h>
@@ -79,7 +79,7 @@ static void copy_to_parent_log(const char *prefix,
 
 struct peer *new_peer(struct lightningd *ld, u64 dbid,
 		      const struct pubkey *id,
-		      const struct wireaddr *addr)
+		      const struct wireaddr_internal *addr)
 {
 	/* We are owned by our channels, and freed manually by destroy_channel */
 	struct peer *peer = tal(NULL, struct peer);
@@ -88,10 +88,13 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	peer->dbid = dbid;
 	peer->id = *id;
 	peer->uncommitted_channel = NULL;
+	/* FIXME: This is always set, right? */
 	if (addr)
 		peer->addr = *addr;
-	else
-		peer->addr.type = ADDR_TYPE_PADDING;
+	else {
+		peer->addr.itype = ADDR_INTERNAL_WIREADDR;
+		peer->addr.u.wireaddr.type = ADDR_TYPE_PADDING;
+	}
 	list_head_init(&peer->channels);
 	peer->direction = get_channel_direction(&peer->ld->id, &peer->id);
 
@@ -162,25 +165,33 @@ u8 *p2wpkh_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
 
 u32 feerate_min(struct lightningd *ld)
 {
-	if (ld->config.ignore_fee_limits)
-		return 1;
+	u32 min;
 
-	/* Set this to average of slow and normal.*/
-	return (get_feerate(ld->topology, FEERATE_SLOW)
-		+ get_feerate(ld->topology, FEERATE_NORMAL)) / 2;
+	/* We can't allow less than feerate_floor, since that won't relay */
+	if (ld->config.ignore_fee_limits)
+		min = 1;
+	else
+		/* Set this to half of slow rate.*/
+		min = get_feerate(ld->topology, FEERATE_SLOW) / 2;
+
+	if (min < feerate_floor())
+		return feerate_floor();
+	return min;
 }
 
 /* BOLT #2:
  *
- * Given the variance in fees, and the fact that the transaction may
- * be spent in the future, it's a good idea for the fee payer to keep
- * a good margin, say 5x the expected fee requirement */
+ * Given the variance in fees, and the fact that the transaction may be
+ * spent in the future, it's a good idea for the fee payer to keep a good
+ * margin (say 5x the expected fee requirement)
+ */
 u32 feerate_max(struct lightningd *ld)
 {
 	if (ld->config.ignore_fee_limits)
 		return UINT_MAX;
 
-	return get_feerate(ld->topology, FEERATE_IMMEDIATE) * 5;
+	return get_feerate(ld->topology, FEERATE_IMMEDIATE) *
+	       ld->config.max_fee_multiplier;
 }
 
 static void sign_last_tx(struct channel *channel)
@@ -268,7 +279,8 @@ destroy_close_command_on_channel_destroy(struct channel *_ UNUSED,
 	 * Clear the cc->channel first so that we will not try to
 	 * remove a destructor. */
 	cc->channel = NULL;
-	command_fail(cc->cmd, "Channel forgotten before proper close.");
+	command_fail(cc->cmd, LIGHTNINGD,
+		     "Channel forgotten before proper close.");
 }
 
 /* Destroy the close command structure. */
@@ -300,7 +312,7 @@ close_command_timeout(struct close_command *cc)
 	else
 		/* Fail the command directly, which will resolve the
 		 * command and destroy the close_command. */
-		command_fail(cc->cmd,
+		command_fail(cc->cmd, LIGHTNINGD,
 			     "Channel close negotiation not finished "
 			     "before timeout");
 }
@@ -332,6 +344,12 @@ register_close_command(struct lightningd *ld,
 void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		   bool cooperative)
 {
+	u8 *msg;
+
+	/* Tell gossipd we no longer need to keep connection to this peer */
+	msg = towire_gossipctl_peer_important(NULL, &channel->peer->id, false);
+	subd_send_msg(ld->gossip, take(msg));
+
 	sign_last_tx(channel);
 
 	/* Keep broadcasting until we say stop (can fail due to dup,
@@ -346,7 +364,6 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 void channel_errmsg(struct channel *channel,
 		    int peer_fd, int gossip_fd,
 		    const struct crypto_state *cs,
-		    u64 gossip_index,
 		    const struct channel_id *channel_id UNUSED,
 		    const char *desc,
 		    const u8 *err_for_them)
@@ -367,12 +384,15 @@ void channel_errmsg(struct channel *channel,
 					     err_for_them,
 					     tal_len(err_for_them), 0);
 
+	/* Make sure channel_fail_permanent doesn't tell gossipd we died! */
+	channel->connected = false;
+
 	/* BOLT #1:
 	 *
 	 * A sending node:
 	 *...
 	 *   - when `channel_id` is 0:
-	 *    - MUST fail all channels.
+	 *    - MUST fail all channels with the receiving node.
 	 *    - MUST close the connection.
 	 */
 	/* FIXME: Gossipd closes connection, but doesn't fail channels. */
@@ -385,7 +405,8 @@ void channel_errmsg(struct channel *channel,
 	 *...
 	 * The receiving node:
 	 *  - upon receiving `error`:
-	 *    - MUST fail the channel referred to by the error message.
+	 *    - MUST fail the channel referred to by the error message,
+	 *      if that channel is with the sending node.
 	 */
 	channel_fail_permanent(channel, "%s: %s ERROR %s",
 			       channel->owner->name,
@@ -393,14 +414,14 @@ void channel_errmsg(struct channel *channel,
 
 	/* Hand back to gossipd, with any error packet. */
 	msg = towire_gossipctl_hand_back_peer(NULL, &channel->peer->id,
-					      cs, gossip_index,
-					      err_for_them);
+					      cs, err_for_them);
 	subd_send_msg(ld->gossip, take(msg));
 	subd_send_fd(ld->gossip, peer_fd);
 	subd_send_fd(ld->gossip, gossip_fd);
 }
 
-/* Gossipd tells us a peer has connected */
+/* Gossipd tells us a peer has connected: it never hands us duplicates, since
+ * it holds them until we say peer_died. */
 void peer_connected(struct lightningd *ld, const u8 *msg,
 		    int peer_fd, int gossip_fd)
 {
@@ -411,12 +432,11 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	u8 *global_features;
 	u8 *local_features;
 	struct channel *channel;
-	struct wireaddr addr;
-	u64 gossip_index;
+	struct wireaddr_internal addr;
 	struct uncommitted_channel *uc;
 
 	if (!fromwire_gossip_peer_connected(msg, msg,
-					    &id, &addr, &cs, &gossip_index,
+					    &id, &addr, &cs,
 					    &gfeatures, &lfeatures))
 		fatal("Gossip gave bad GOSSIP_PEER_CONNECTED message %s",
 		      tal_hex(msg, msg));
@@ -440,16 +460,18 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 		goto send_error;
 	}
 
+	/* Were we trying to open a channel, and we've raced? */
+	if (handle_opening_channel(ld, &id, &addr, &cs,
+				   gfeatures, lfeatures, peer_fd, gossip_fd))
+		return;
+
 	/* If we're already dealing with this peer, hand off to correct
 	 * subdaemon.  Otherwise, we'll respond iff they ask about an inactive
 	 * channel. */
 	channel = active_channel_by_id(ld, &id, &uc);
 
-	/* Opening now?  Kill it */
-	if (uc) {
-		kill_uncommitted_channel(uc, "Peer reconnected");
-		goto return_to_gossipd;
-	}
+	/* Can't be opening now, since we wouldn't have sent peer_died. */
+	assert(!uc);
 
 	if (channel) {
 		log_debug(channel->log, "Peer has reconnected, state %s",
@@ -479,47 +501,32 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 		case CHANNELD_AWAITING_LOCKIN:
 		case CHANNELD_NORMAL:
 		case CHANNELD_SHUTTING_DOWN:
-			/* Stop any existing daemon, without triggering error
-			 * on this peer. */
-			channel_set_owner(channel, NULL);
+			assert(!channel->owner);
 
 			channel->peer->addr = addr;
-			peer_start_channeld(channel, &cs, gossip_index,
+			peer_start_channeld(channel, &cs,
 					    peer_fd, gossip_fd, NULL,
 					    true);
-			goto connected;
+			return;
 
 		case CLOSINGD_SIGEXCHANGE:
-			/* Stop any existing daemon, without triggering error
-			 * on this peer. */
-			channel_set_owner(channel, NULL);
+			assert(!channel->owner);
 
 			channel->peer->addr = addr;
-			peer_start_closingd(channel, &cs, gossip_index,
+			peer_start_closingd(channel, &cs,
 					    peer_fd, gossip_fd,
-					    true);
-			goto connected;
+					    true, NULL);
+			return;
 		}
 		abort();
 	}
 
-return_to_gossipd:
-	/* Otherwise, we hand back to gossipd, to continue. */
-	msg = towire_gossipctl_hand_back_peer(msg, &id, &cs, gossip_index, NULL);
-	subd_send_msg(ld->gossip, take(msg));
-	subd_send_fd(ld->gossip, peer_fd);
-	subd_send_fd(ld->gossip, gossip_fd);
-
-connected:
-	/* If we were waiting for connection, we succeeded. */
-	connect_succeeded(ld, &id);
-	return;
+	/* No err, all good. */
+	error = NULL;
 
 send_error:
 	/* Hand back to gossipd, with an error packet. */
-	connect_failed(ld, &id, sanitize_error(msg, error, NULL));
-	msg = towire_gossipctl_hand_back_peer(msg, &id, &cs, gossip_index,
-					      error);
+	msg = towire_gossipctl_hand_back_peer(msg, &id, &cs, error);
 	subd_send_msg(ld->gossip, take(msg));
 	subd_send_fd(ld->gossip, peer_fd);
 	subd_send_fd(ld->gossip, gossip_fd);
@@ -536,7 +543,7 @@ static struct channel *channel_by_channel_id(struct peer *peer,
 		derive_channel_id(&cid,
 				  &channel->funding_txid,
 				  channel->funding_outnum);
-		if (structeq(&cid, channel_id))
+		if (channel_id_eq(&cid, channel_id))
 			return channel;
 	}
 	return NULL;
@@ -545,9 +552,8 @@ static struct channel *channel_by_channel_id(struct peer *peer,
 /* We only get here IF we weren't trying to connect to it. */
 void peer_sent_nongossip(struct lightningd *ld,
 			 const struct pubkey *id,
-			 const struct wireaddr *addr,
+			 const struct wireaddr_internal *addr,
 			 const struct crypto_state *cs,
-			 u64 gossip_index,
 			 const u8 *gfeatures,
 			 const u8 *lfeatures,
 			 int peer_fd, int gossip_fd,
@@ -567,7 +573,7 @@ void peer_sent_nongossip(struct lightningd *ld,
 	/* Open request? */
 	if (fromwire_peektype(in_msg) == WIRE_OPEN_CHANNEL) {
 		error = peer_accept_channel(tmpctx,
-					    ld, id, addr, cs, gossip_index,
+					    ld, id, addr, cs,
 					    gfeatures, lfeatures,
 					    peer_fd, gossip_fd, channel_id,
 					    in_msg);
@@ -585,6 +591,17 @@ void peer_sent_nongossip(struct lightningd *ld,
 			error = channel->error;
 			goto send_error;
 		}
+
+		/* Reestablish for a now-closed channel?  They might have
+		 * missed final update, so do the closing negotiation dance
+		 * again. */
+		if (fromwire_peektype(in_msg) == WIRE_CHANNEL_REESTABLISH
+		    && channel
+		    && channel->state == CLOSINGD_COMPLETE) {
+			peer_start_closingd(channel, cs,
+					    peer_fd, gossip_fd, true, in_msg);
+			return;
+		}
 	}
 
 	/* Weird request. */
@@ -594,33 +611,10 @@ void peer_sent_nongossip(struct lightningd *ld,
 
 send_error:
 	/* Hand back to gossipd, with an error packet. */
-	connect_failed(ld, id, sanitize_error(tmpctx, error, NULL));
-	msg = towire_gossipctl_hand_back_peer(ld, id, cs, gossip_index, error);
+	msg = towire_gossipctl_hand_back_peer(ld, id, cs, error);
 	subd_send_msg(ld->gossip, take(msg));
 	subd_send_fd(ld->gossip, peer_fd);
 	subd_send_fd(ld->gossip, gossip_fd);
-}
-
-static enum watch_result funding_announce_cb(struct channel *channel,
-					     const struct bitcoin_txid *txid UNUSED,
-					     unsigned int depth)
-{
-	if (depth < ANNOUNCE_MIN_DEPTH) {
-		return KEEP_WATCHING;
-	}
-
-	if (!channel->owner || !streq(channel->owner->name, "lightning_channeld")) {
-		log_debug(channel->log,
-			  "Funding tx announce ready, but channel state %s"
-			  " owned by %s",
-			  channel_state_name(channel),
-			  channel->owner ? channel->owner->name : "none");
-		return KEEP_WATCHING;
-	}
-
-	subd_send_msg(channel->owner,
-		      take(towire_channel_funding_announce_depth(channel)));
-	return DELETE_WATCH;
 }
 
 static enum watch_result funding_lockin_cb(struct channel *channel,
@@ -628,8 +622,6 @@ static enum watch_result funding_lockin_cb(struct channel *channel,
 					   unsigned int depth)
 {
 	const char *txidstr;
-	struct txlocator *loc;
-	bool channel_ready;
 	struct lightningd *ld = channel->peer->ld;
 
 	txidstr = type_to_string(channel, struct bitcoin_txid, txid);
@@ -640,51 +632,57 @@ static enum watch_result funding_lockin_cb(struct channel *channel,
 	if (depth < channel->minimum_depth)
 		return KEEP_WATCHING;
 
-	loc = wallet_transaction_locate(channel, ld->wallet, txid);
-
 	/* If we restart, we could already have peer->scid from database */
 	if (!channel->scid) {
+		struct txlocator *loc;
+
+		loc = wallet_transaction_locate(tmpctx, ld->wallet, txid);
 		channel->scid = tal(channel, struct short_channel_id);
 		mk_short_channel_id(channel->scid,
 				    loc->blkheight, loc->index,
 				    channel->funding_outnum);
+		/* We've added scid, update */
+		wallet_channel_save(ld->wallet, channel);
 	}
-	tal_free(loc);
 
-	/* In theory, it could have been buried before we got back
-	 * from accepting openingd or disconnected: just wait for next one. */
-	channel_ready = (channel->owner && channel->state == CHANNELD_AWAITING_LOCKIN);
-	if (!channel_ready) {
-		log_debug(channel->log,
-			  "Funding tx confirmed, but channel state %s %s",
-			  channel_state_name(channel),
-			  channel->owner ? channel->owner->name : "unowned");
-	} else {
-		subd_send_msg(channel->owner,
-			      take(towire_channel_funding_locked(channel,
-								 channel->scid)));
-	}
+	/* Try to tell subdaemon */
+	if (!channel_tell_funding_locked(ld, channel, txid, depth))
+		return KEEP_WATCHING;
 
 	/* BOLT #7:
 	 *
-	 * If the `open_channel` message had the `announce_channel` bit set,
-	 * then both nodes must send the `announcement_signatures` message,
-	 * otherwise they MUST NOT.
+	 * A node:
+	 *   - if the `open_channel` message has the `announce_channel` bit set
+	 *     AND a `shutdown` message has not been sent:
+	 *     - MUST send the `announcement_signatures` message.
+	 *       - MUST NOT send `announcement_signatures` messages until
+	 *         `funding_locked` has been sent AND the funding transaction has
+	 *         at least six confirmations.
+	 *   - otherwise:
+	 *     - MUST NOT send the `announcement_signatures` message.
 	 */
 	if (!(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL))
 		return DELETE_WATCH;
 
-	/* Tell channeld that we have reached the announce_depth and
-	 * that it may send the announcement_signatures upon receiving
-	 * funding_locked, or right now if it already received it
-	 * before. If we are at the right depth, call the callback
-	 * directly, otherwise schedule a callback */
-	if (depth >= ANNOUNCE_MIN_DEPTH)
-		funding_announce_cb(channel, txid, depth);
-	else
-		watch_txid(channel, ld->topology, channel, txid,
-			   funding_announce_cb);
+	/* We keep telling it depth until we get to announce depth. */
+	if (depth < ANNOUNCE_MIN_DEPTH)
+		return KEEP_WATCHING;
+
 	return DELETE_WATCH;
+}
+
+static enum watch_result funding_spent(struct channel *channel,
+				       const struct bitcoin_tx *tx,
+				       size_t inputnum UNUSED,
+				       const struct block *block)
+{
+	struct bitcoin_txid txid;
+	bitcoin_txid(tx, &txid);
+
+	wallet_channeltxs_add(channel->peer->ld->wallet, channel,
+			      WIRE_ONCHAIN_INIT, &txid, 0, block->height);
+
+	return onchaind_funding_spent(channel, tx, block->height);
 }
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)
@@ -735,13 +733,14 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 {
 	/* This is a little sneaky... */
 	struct pubkey *ids;
-	struct wireaddr *addrs;
+	struct wireaddr_internal *addrs;
 	struct gossip_getnodes_entry **nodes;
 	struct json_result *response = new_json_result(gpa->cmd);
 	struct peer *p;
 
 	if (!fromwire_gossip_getpeers_reply(msg, msg, &ids, &addrs, &nodes)) {
-		command_fail(gpa->cmd, "Bad response from gossipd");
+		command_fail(gpa->cmd, LIGHTNINGD,
+			     "Bad response from gossipd");
 		return;
 	}
 
@@ -764,16 +763,17 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 			connected = true;
 		else {
 			channel = peer_active_channel(p);
-			connected = channel && channel->owner;
+			connected = channel && channel->connected;
 		}
 		json_add_bool(response, "connected", connected);
 
 		if (connected) {
 			json_array_start(response, "netaddr");
-			if (p->addr.type != ADDR_TYPE_PADDING)
+			if (p->addr.itype != ADDR_INTERNAL_WIREADDR
+			    || p->addr.u.wireaddr.type != ADDR_TYPE_PADDING)
 				json_add_string(response, NULL,
 						type_to_string(response,
-							       struct wireaddr,
+							       struct wireaddr_internal,
 							       &p->addr));
 			json_array_end(response);
 		}
@@ -911,9 +911,11 @@ static void gossipd_getpeers_complete(struct subd *gossip, const u8 *msg,
 		json_add_pubkey(response, "id", ids+i);
 		json_add_node_decoration(response, nodes, ids+i);
 		json_array_start(response, "netaddr");
-		if (addrs[i].type != ADDR_TYPE_PADDING)
+		if (addrs[i].itype != ADDR_INTERNAL_WIREADDR
+		    || addrs[i].u.wireaddr.type != ADDR_TYPE_PADDING)
 			json_add_string(response, NULL,
-					type_to_string(response, struct wireaddr,
+					type_to_string(response,
+						       struct wireaddr_internal,
 						       addrs + i));
 		json_array_end(response);
 		json_add_bool(response, "connected", true);
@@ -945,7 +947,8 @@ static void json_listpeers(struct command *cmd,
 	if (idtok) {
 		gpa->specific_id = tal_arr(cmd, struct pubkey, 1);
 		if (!json_tok_pubkey(buffer, idtok, gpa->specific_id)) {
-			command_fail(cmd, "id %.*s not valid",
+			command_fail(cmd, LIGHTNINGD,
+				     "id %.*s not valid",
 				     idtok->end - idtok->start,
 				     buffer + idtok->start);
 			return;
@@ -954,7 +957,8 @@ static void json_listpeers(struct command *cmd,
 	if (leveltok) {
 		gpa->ll = tal(gpa, enum log_level);
 		if (!json_tok_loglevel(buffer, leveltok, gpa->ll)) {
-			command_fail(cmd, "Invalid level param");
+			command_fail(cmd, LIGHTNINGD,
+				     "Invalid level param");
 			return;
 		}
 	} else
@@ -974,10 +978,60 @@ static const struct json_command listpeers_command = {
 };
 AUTODATA(json_command, &listpeers_command);
 
+static struct channel *
+command_find_channel(struct command *cmd,
+		     const char *buffer, const jsmntok_t *tok)
+{
+	struct lightningd *ld = cmd->ld;
+	struct channel_id cid;
+	struct channel_id channel_cid;
+	struct short_channel_id scid;
+	struct peer *peer;
+	struct channel *channel;
+
+	if (json_tok_channel_id(buffer, tok, &cid)) {
+		list_for_each(&ld->peers, peer, list) {
+			channel = peer_active_channel(peer);
+			if (!channel)
+				continue;
+			derive_channel_id(&channel_cid,
+					  &channel->funding_txid,
+					  channel->funding_outnum);
+			if (channel_id_eq(&channel_cid, &cid))
+				return channel;
+		}
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Channel ID not found: '%.*s'",
+			     tok->end - tok->start,
+			     buffer + tok->start);
+		return NULL;
+	} else if (json_tok_short_channel_id(buffer, tok, &scid)) {
+		list_for_each(&ld->peers, peer, list) {
+			channel = peer_active_channel(peer);
+			if (!channel)
+				continue;
+			if (channel->scid && channel->scid->u64 == scid.u64)
+				return channel;
+		}
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Short channel ID not found: '%.*s'",
+			     tok->end - tok->start,
+			     buffer + tok->start);
+		return NULL;
+	} else {
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Given id is not a channel ID or "
+			     "short channel ID: '%.*s'",
+			     tok->end - tok->start,
+			     buffer + tok->start);
+		return NULL;
+	}
+}
+
 static void json_close(struct command *cmd,
 		       const char *buffer, const jsmntok_t *params)
 {
-	jsmntok_t *peertok;
+	jsmntok_t *idtok;
 	jsmntok_t *timeouttok;
 	jsmntok_t *forcetok;
 	struct peer *peer;
@@ -986,33 +1040,38 @@ static void json_close(struct command *cmd,
 	bool force = false;
 
 	if (!json_get_params(cmd, buffer, params,
-			     "id", &peertok,
+			     "id", &idtok,
 			     "?force", &forcetok,
 			     "?timeout", &timeouttok,
 			     NULL)) {
 		return;
 	}
 
-	peer = peer_from_json(cmd->ld, buffer, peertok);
-	if (!peer) {
-		command_fail(cmd, "Could not find peer with that id");
-		return;
-	}
 	if (forcetok && !json_tok_bool(buffer, forcetok, &force)) {
-		command_fail(cmd, "Force '%.*s' must be true or false",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Force '%.*s' must be true or false",
 			     forcetok->end - forcetok->start,
 			     buffer + forcetok->start);
 		return;
 	}
 	if (timeouttok && !json_tok_number(buffer, timeouttok, &timeout)) {
-		command_fail(cmd, "Timeout '%.*s' is not a number",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Timeout '%.*s' is not a number",
 			     timeouttok->end - timeouttok->start,
 			     buffer + timeouttok->start);
 		return;
 	}
 
-	channel = peer_active_channel(peer);
-	if (!channel) {
+	peer = peer_from_json(cmd->ld, buffer, idtok);
+	if (peer)
+		channel = peer_active_channel(peer);
+	else {
+		channel = command_find_channel(cmd, buffer, idtok);
+		if (!channel)
+			return;
+	}
+
+	if (!channel && peer) {
 		struct uncommitted_channel *uc = peer->uncommitted_channel;
 		if (uc) {
 			/* Easy case: peer can simply be forgotten. */
@@ -1021,7 +1080,8 @@ static void json_close(struct command *cmd,
 			command_success(cmd, null_response(cmd));
 			return;
 		}
-		command_fail(cmd, "Peer has no active channel");
+		command_fail(cmd, LIGHTNINGD,
+			     "Peer has no active channel");
 		return;
 	}
 
@@ -1034,7 +1094,7 @@ static void json_close(struct command *cmd,
 	    channel->state != CHANNELD_AWAITING_LOCKIN &&
 	    channel->state != CHANNELD_SHUTTING_DOWN &&
 	    channel->state != CLOSINGD_SIGEXCHANGE)
-		command_fail(cmd, "Peer is in state %s",
+		command_fail(cmd, LIGHTNINGD, "Channel is in state %s",
 			     channel_state_name(channel));
 
 	/* If normal or locking in, transition to shutting down
@@ -1049,13 +1109,6 @@ static void json_close(struct command *cmd,
 			subd_send_msg(channel->owner,
 				      take(towire_channel_send_shutdown(channel)));
 	}
-	/* If channel has no owner, it means the peer is disconnected,
-	 * so make a nominal effort to contact it now.
-	 */
-	if (!channel->owner)
-		subd_send_msg(cmd->ld->gossip,
-			      take(towire_gossipctl_reach_peer(NULL,
-							       &channel->peer->id)));
 
 	/* Register this command for later handling. */
 	register_close_command(cmd->ld, cmd, channel, timeout, force);
@@ -1067,7 +1120,12 @@ static void json_close(struct command *cmd,
 static const struct json_command close_command = {
 	"close",
 	json_close,
-	"Close the channel with peer {id}"
+	"Close the channel with {id} "
+	"(either peer ID, channel ID, or short channel ID). "
+	"If {force} (default false) is true, force a unilateral close "
+	"after {timeout} seconds (default 30), "
+	"otherwise just schedule a mutual close later and fail after "
+	"timing out."
 };
 AUTODATA(json_command, &close_command);
 
@@ -1081,12 +1139,11 @@ static void activate_peer(struct peer *peer)
 	msg = towire_gossipctl_peer_addrhint(peer, &peer->id, &peer->addr);
 	subd_send_msg(peer->ld->gossip, take(msg));
 
-	/* We can only have one active channel: reconnect if not already. */
+	/* We can only have one active channel: make sure gossipd
+	 * knows to reconnect. */
 	channel = peer_active_channel(peer);
-	if (channel && !channel->owner) {
-		msg = towire_gossipctl_reach_peer(peer, &peer->id);
-		subd_send_msg(peer->ld->gossip, take(msg));
-	}
+	if (channel)
+		tell_gossipd_peer_is_important(ld, channel);
 
 	list_for_each(&peer->channels, channel, list) {
 		/* Watching lockin may be unnecessary, but it's harmless. */
@@ -1114,9 +1171,10 @@ static void gossip_peer_disconnected (struct subd *gossip,
 			fatal("Gossip daemon gave invalid reply %s",
 			      tal_hex(gossip, resp));
 		if (isconnected)
-			command_fail(cmd, "Peer is not in gossip mode");
+			command_fail(cmd, LIGHTNINGD,
+				     "Peer is not in gossip mode");
 		else
-			command_fail(cmd, "Peer not connected");
+			command_fail(cmd, LIGHTNINGD, "Peer not connected");
 	} else {
 		/* Successfully disconnected */
 		command_success(cmd, null_response(cmd));
@@ -1138,7 +1196,7 @@ static void json_disconnect(struct command *cmd,
 	}
 
 	if (!json_tok_pubkey(buffer, idtok, &id)) {
-		command_fail(cmd, "id %.*s not valid",
+		command_fail(cmd, LIGHTNINGD, "id %.*s not valid",
 			     idtok->end - idtok->start,
 			     buffer + idtok->start);
 		return;
@@ -1174,12 +1232,14 @@ static void json_sign_last_tx(struct command *cmd,
 
 	peer = peer_from_json(cmd->ld, buffer, peertok);
 	if (!peer) {
-		command_fail(cmd, "Could not find peer with that id");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find peer with that id");
 		return;
 	}
 	channel = peer_active_channel(peer);
 	if (!channel) {
-		command_fail(cmd, "Could has not active channel");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find active channel");
 		return;
 	}
 
@@ -1217,13 +1277,15 @@ static void json_dev_fail(struct command *cmd,
 
 	peer = peer_from_json(cmd->ld, buffer, peertok);
 	if (!peer) {
-		command_fail(cmd, "Could not find peer with that id");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find peer with that id");
 		return;
 	}
 
 	channel = peer_active_channel(peer);
 	if (!channel) {
-		command_fail(cmd, "Could not find active channel with peer");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find active channel with peer");
 		return;
 	}
 
@@ -1262,22 +1324,26 @@ static void json_dev_reenable_commit(struct command *cmd,
 
 	peer = peer_from_json(cmd->ld, buffer, peertok);
 	if (!peer) {
-		command_fail(cmd, "Could not find peer with that id");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find peer with that id");
 		return;
 	}
 
 	channel = peer_active_channel(peer);
 	if (!channel) {
-		command_fail(cmd, "Peer has no active channel");
+		command_fail(cmd, LIGHTNINGD,
+			     "Peer has no active channel");
 		return;
 	}
 	if (!channel->owner) {
-		command_fail(cmd, "Peer has no owner");
+		command_fail(cmd, LIGHTNINGD,
+			     "Peer has no owner");
 		return;
 	}
 
 	if (!streq(channel->owner->name, "lightning_channeld")) {
-		command_fail(cmd, "Peer owned by %s", channel->owner->name);
+		command_fail(cmd, LIGHTNINGD,
+			     "Peer owned by %s", channel->owner->name);
 		return;
 	}
 
@@ -1308,7 +1374,7 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 	struct json_result *response;
 	struct dev_forget_channel_cmd *forget = arg;
 	if (txout != NULL && !forget->force) {
-		command_fail(forget->cmd,
+		command_fail(forget->cmd, LIGHTNINGD,
 			     "Cowardly refusing to forget channel with an "
 			     "unspent funding output, if you know what "
 			     "you're doing you can override with "
@@ -1348,7 +1414,8 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 	}
 
 	if (scidtok && !json_tok_short_channel_id(buffer, scidtok, &scid)) {
-		command_fail(cmd, "Invalid short_channel_id '%.*s'",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Invalid short_channel_id '%.*s'",
 			     scidtok->end - scidtok->start,
 			     buffer + scidtok->start);
 		return;
@@ -1360,7 +1427,8 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 
 	peer = peer_from_json(cmd->ld, buffer, nodeidtok);
 	if (!peer) {
-		command_fail(cmd, "Could not find channel with that peer");
+		command_fail(cmd, LIGHTNINGD,
+			     "Could not find channel with that peer");
 		return;
 	}
 
@@ -1369,11 +1437,11 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 		if (scidtok) {
 			if (!channel->scid)
 				continue;
-			if (!structeq(channel->scid, &scid))
+			if (!short_channel_id_eq(channel->scid, &scid))
 				continue;
 		}
 		if (forget->channel) {
-			command_fail(cmd,
+			command_fail(cmd, LIGHTNINGD,
 				     "Multiple channels:"
 				     " please specify short_channel_id");
 			return;
@@ -1381,16 +1449,17 @@ static void json_dev_forget_channel(struct command *cmd, const char *buffer,
 		forget->channel = channel;
 	}
 	if (!forget->channel) {
-		command_fail(cmd,
+		command_fail(cmd, LIGHTNINGD,
 			     "No channels matching that short_channel_id");
 		return;
 	}
 
 	if (channel_has_htlc_out(forget->channel) ||
 	    channel_has_htlc_in(forget->channel)) {
-		command_fail(cmd, "This channel has HTLCs attached and it is "
-				  "not safe to forget it. Please use `close` "
-				  "or `dev-fail` instead.");
+		command_fail(cmd, LIGHTNINGD,
+			     "This channel has HTLCs attached and it is "
+			     "not safe to forget it. Please use `close` "
+			     "or `dev-fail` instead.");
 		return;
 
 	}

@@ -8,6 +8,7 @@
 
 struct bitcoin_txid;
 struct wireaddr;
+struct wallet_tx;
 
 /* Context for a command (from JSON, but might outlive the connection!)
  * You can allocate off this for temporary objects. */
@@ -71,7 +72,8 @@ bool json_get_params(struct command *cmd,
 
 struct json_result *null_response(const tal_t *ctx);
 void command_success(struct command *cmd, struct json_result *response);
-void PRINTF_FMT(2, 3) command_fail(struct command *cmd, const char *fmt, ...);
+void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
+				   const char *fmt, ...);
 void PRINTF_FMT(4, 5) command_fail_detailed(struct command *cmd,
 					     int code,
 					     const struct json_result *data,
@@ -100,6 +102,10 @@ json_tok_address_scriptpubkey(const tal_t *ctx,
 			      const struct chainparams *chainparams,
 			      const char *buffer,
 			      const jsmntok_t *tok, const u8 **scriptpubkey);
+
+/* Parse the satoshi token in wallet_tx. */
+bool json_tok_wtx(struct wallet_tx * tx, const char * buffer,
+		  const jsmntok_t * sattok);
 
 AUTODATA_TYPE(json_command, struct json_command);
 #endif /* LIGHTNING_LIGHTNINGD_JSONRPC_H */

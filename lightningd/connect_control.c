@@ -6,6 +6,7 @@
 #include <lightningd/connect_control.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/subd.h>
@@ -28,79 +29,52 @@ static struct connect *new_connect(struct lightningd *ld,
 	struct connect *c = tal(cmd, struct connect);
 	c->id = *id;
 	c->cmd = cmd;
-	list_add(&ld->connects, &c->list);
+	list_add_tail(&ld->connects, &c->list);
 	tal_add_destructor(c, destroy_connect);
 	return c;
 }
 
-void connect_succeeded(struct lightningd *ld, const struct pubkey *id)
+/* Finds first command which matches. */
+static struct connect *find_connect(struct lightningd *ld,
+				    const struct pubkey *id)
 {
-	struct connect *i, *next;
+	struct connect *i;
 
-	/* Careful!  Completing command frees connect. */
-	list_for_each_safe(&ld->connects, i, next, list) {
-		struct json_result *response;
-
-		if (!pubkey_eq(&i->id, id))
-			continue;
-
-		response = new_json_result(i->cmd);
-		json_object_start(response, NULL);
-		json_add_pubkey(response, "id", id);
-		json_object_end(response);
-		command_success(i->cmd, response);
-	}
-}
-
-void connect_failed(struct lightningd *ld, const struct pubkey *id,
-		    const char *error)
-{
-	struct connect *i, *next;
-
-	/* Careful!  Completing command frees connect. */
-	list_for_each_safe(&ld->connects, i, next, list) {
+	list_for_each(&ld->connects, i, list) {
 		if (pubkey_eq(&i->id, id))
-			command_fail(i->cmd, "%s", error);
+			return i;
 	}
+	return NULL;
 }
 
-void peer_connection_failed(struct lightningd *ld, const u8 *msg)
+void gossip_connect_result(struct lightningd *ld, const u8 *msg)
 {
 	struct pubkey id;
-	u32 attempts, timediff;
-	bool addr_unknown;
-	char *error;
+	bool connected;
+	char *err;
+	struct connect *c;
 
-	if (!fromwire_gossip_peer_connection_failed(msg, &id, &timediff,
-						    &attempts, &addr_unknown))
-		fatal(
-		    "Gossip gave bad GOSSIP_PEER_CONNECTION_FAILED message %s",
-		    tal_hex(msg, msg));
-
-	if (addr_unknown) {
-		error = tal_fmt(
-		    msg, "No address known for node %s, please provide one",
-		    type_to_string(msg, struct pubkey, &id));
-	} else {
-		error = tal_fmt(msg, "Could not connect to %s after %d seconds and %d attempts",
-				type_to_string(msg, struct pubkey, &id), timediff,
-				attempts);
-	}
-
-	connect_failed(ld, &id, error);
-}
-
-/* Gossipd tells us peer was already connected. */
-void peer_already_connected(struct lightningd *ld, const u8 *msg)
-{
-	struct pubkey id;
-
-	if (!fromwire_gossip_peer_already_connected(msg, &id))
-		fatal("Gossip gave bad GOSSIP_PEER_ALREADY_CONNECTED message %s",
+	if (!fromwire_gossipctl_connect_to_peer_result(tmpctx, msg,
+						       &id,
+						       &connected,
+						       &err))
+		fatal("Gossip gave bad GOSSIPCTL_CONNECT_TO_PEER_RESULT message %s",
 		      tal_hex(msg, msg));
 
-	/* If we were waiting for connection, we succeeded. */
-	connect_succeeded(ld, &id);
+
+	/* We can have multiple connect commands: complete them all */
+	while ((c = find_connect(ld, &id)) != NULL) {
+		if (connected) {
+			struct json_result *response = new_json_result(c->cmd);
+			json_object_start(response, NULL);
+			json_add_pubkey(response, "id", &id);
+			json_object_end(response);
+			command_success(c->cmd, response);
+		} else {
+			command_fail(c->cmd, LIGHTNINGD, "%s", err);
+		}
+		/* They delete themselves from list */
+	}
 }
 
 static void json_connect(struct command *cmd,
@@ -112,7 +86,7 @@ static void json_connect(struct command *cmd,
 	char *atptr;
 	char *ataddr = NULL;
 	const char *name;
-	struct wireaddr addr;
+	struct wireaddr_internal addr;
 	u8 *msg;
 	const char *err_msg;
 
@@ -136,14 +110,15 @@ static void json_connect(struct command *cmd,
 	}
 
 	if (!json_tok_pubkey(buffer, idtok, &id)) {
-		command_fail(cmd, "id %.*s not valid",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "id %.*s not valid",
 			     idtok->end - idtok->start,
 			     buffer + idtok->start);
 		return;
 	}
 
 	if (hosttok && ataddr) {
-		command_fail(cmd,
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			     "Can't specify host as both xxx@yyy "
 			     "and separate argument");
 		return;
@@ -160,28 +135,33 @@ static void json_connect(struct command *cmd,
 
 	/* Port without host name? */
 	if (porttok && !name) {
-		command_fail(cmd, "Can't specify port without host");
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Can't specify port without host");
 		return;
 	}
 
 	/* Was there parseable host name? */
 	if (name) {
+		u32 port;
 		/* Is there a port? */
 		if (porttok) {
-			u32 port;
-			if (!json_tok_number(buffer, porttok, &port)) {
-				command_fail(cmd, "Port %.*s not valid",
+			if (!json_tok_number(buffer, porttok, &port) || !port) {
+				command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					     "Port %.*s not valid",
 					     porttok->end - porttok->start,
 					     buffer + porttok->start);
 				return;
 			}
-			addr.port = port;
 		} else {
-			addr.port = DEFAULT_PORT;
+			port = DEFAULT_PORT;
 		}
-		if (!parse_wireaddr(name, &addr, addr.port, &err_msg) || !addr.port) {
-			command_fail(cmd, "Host %s:%u not valid: %s",
-				     name, addr.port, err_msg ? err_msg : "port is 0");
+		if (!parse_wireaddr_internal(name, &addr, port, false,
+					     !cmd->ld->use_proxy_always
+					     && !cmd->ld->pure_tor_setup,
+					     true,
+					     &err_msg)) {
+			command_fail(cmd, LIGHTNINGD, "Host %s:%u not valid: %s",
+				     name, port, err_msg ? err_msg : "port is 0");
 			return;
 		}
 
@@ -190,11 +170,12 @@ static void json_connect(struct command *cmd,
 		subd_send_msg(cmd->ld->gossip, take(msg));
 	}
 
-	/* Now tell it to try reaching it. */
-	msg = towire_gossipctl_reach_peer(cmd, &id);
-	subd_send_msg(cmd->ld->gossip, take(msg));
-
-	/* Leave this here for gossip_peer_connected */
+	/* If there isn't already a connect command, tell gossipd */
+	if (!find_connect(cmd->ld, &id)) {
+		msg = towire_gossipctl_connect_to_peer(NULL, &id);
+		subd_send_msg(cmd->ld->gossip, take(msg));
+	}
+	/* Leave this here for gossip_connect_result */
 	new_connect(cmd->ld, &id, cmd);
 	command_still_pending(cmd);
 }

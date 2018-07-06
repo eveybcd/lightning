@@ -162,7 +162,7 @@ Testing
 -------
 
 There are three kinds of tests.  For best results, you should have
-valgrind installed, and build with DEVELOPER=1 (currently the default).
+valgrind installed, and build with DEVELOPER=1.
 
 * source tests - run by `make check-source`, looks for whitespace,
   header order, and checks formatted quotes from BOLTs if BOLTDIR
@@ -176,15 +176,25 @@ valgrind installed, and build with DEVELOPER=1 (currently the default).
   link (which will conveniently crash if they're called).
 
 * blackbox tests - run by `make check` or directly as
-  `PYTHONPATH=contrib/pylightning DEVELOPER=1 python3
-  tests/test_lightningd.py -f`.
-  You can run these much faster by putting `NO_VALGRIND=1` after
-  DEVELOPER=1, or after `make check`, which has the added bonus of doing
+  `PYTHONPATH=contrib/pylightning python3 tests/test_lightningd.py -f`.
+  You can run these much faster by putting `VALGRIND=0` after `make check`,
+  which has the added bonus of doing
   memory leak detection.  You can also append `LightningDTests.TESTNAME`
   to run a single test.
 
 Our Travis CI instance (see `.travis.yml`) runs all these for each
 pull request.
+
+Source code analysis
+--------------------
+An updated version of the NCC source code analysis tool is available at
+
+https://github.com/bitonic-cjp/ncc
+
+It can be used to analyze the lightningd source code by running
+`make clean && make ncc`. The output (which is built in parallel with the
+binaries) is stored in .nccout files. You can browse it, for instance, with
+a command like `nccnav lightningd/lightningd.nccout`.
 
 Subtleties
 ----------
@@ -192,9 +202,8 @@ Subtleties
 There are a few subtleties you should be aware of as you modify deeper
 parts of the code:
 
-* `structeq` will not work on some structures.
-  For example, it will not work with `struct short_channel_id` --- use
-  `short_channel_id_eq` for comparing those.
+* `ccan/structeq`'s STRUCTEQ_DEF will define safe comparison function foo_eq()
+  for struct foo, failing the build if the structure has implied padding.
 * `command_success`, `command_fail`, and `command_fail_detailed` will free the
   `cmd` you pass in.
   This also means that if you `tal`-allocated anything from the `cmd`, they

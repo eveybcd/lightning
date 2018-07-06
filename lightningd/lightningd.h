@@ -12,13 +12,6 @@
 #include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
-/* BOLT #1:
- *
- * The default TCP port is 9735. This corresponds to hexadecimal
- * `0x2607`, the Unicode code point for LIGHTNING.
- */
-#define DEFAULT_PORT 9735
-
 /* Various adjustable things. */
 struct config {
 	/* How long do we want them to lock up their funds? (blocks) */
@@ -27,14 +20,8 @@ struct config {
 	/* How long do we let them lock up our funds? (blocks) */
 	u32 locktime_max;
 
-	/* How many blocks before we expect to see anchor?. */
-	u32 anchor_onchain_wait;
-
 	/* How many confirms until we consider an anchor "settled". */
 	u32 anchor_confirms;
-
-	/* How long will we accept them waiting? */
-	u32 anchor_confirms_max;
 
 	/* Maximum percent of fee rate we'll accept. */
 	u32 commitment_fee_max_percent;
@@ -51,18 +38,12 @@ struct config {
 	/* Minimum CLTV if we're the final hop.*/
 	u32 cltv_final;
 
-	/* Maximum time for an expiring HTLC (blocks). */
-	u32 max_htlc_expiry;
-
 	/* Fee rates. */
 	u32 fee_base;
 	s32 fee_per_satoshi;
 
-	/* How long between polling bitcoind. */
-	struct timerel poll_time;
-
 	/* How long between changing commit and sending COMMIT message. */
-	struct timerel commit_time;
+	u32 commit_time_ms;
 
 	/* How often to broadcast gossip (msec) */
 	u32 broadcast_interval;
@@ -72,6 +53,20 @@ struct config {
 
 	/* Do we let the funder set any fee rate they want */
 	bool ignore_fee_limits;
+
+	/* Number of blocks to rescan from the current head, or absolute
+	 * blockheight if rescan >= 500'000 */
+	s32 rescan;
+
+	/* ipv6 bind disable */
+	bool no_ipv6_bind;
+
+	/* Accept fee changes only if they are in the range our_fee -
+	 * our_fee*multiplier */
+	u32 max_fee_multiplier;
+
+	/* Are we allowed to use DNS lookup for peers. */
+	bool use_dns;
 };
 
 struct lightningd {
@@ -107,8 +102,23 @@ struct lightningd {
 	/* Port we're listening on */
 	u16 portnum;
 
-	/* Addresses to announce to the network (tal_count()) */
-	struct wireaddr *wireaddrs;
+	/* Do we want to reconnect to other peers? */
+	bool reconnect;
+
+	/* Do we want to listen for other peers? */
+	bool listen;
+
+	/* Do we want to guess addresses to listen and announce? */
+	bool autolisten;
+
+	/* Setup: Addresses to bind/announce to the network (tal_count()) */
+	struct wireaddr_internal *proposed_wireaddr;
+	/* Setup: And the bitset for each, whether to listen, announce or both */
+	enum addr_listen_announce *proposed_listen_announce;
+
+	/* Actual bindings and announcables from gossipd */
+	struct wireaddr_internal *binding;
+	struct wireaddr *announcable;
 
 	/* Bearer of all my secrets. */
 	int hsm_fd;
@@ -124,6 +134,9 @@ struct lightningd {
 
 	/* Outstanding connect commands. */
 	struct list_head connects;
+
+	/* Outstanding fundchannel commands. */
+	struct list_head fundchannels;
 
 	/* Our chain topology. */
 	struct chain_topology *topology;
@@ -150,22 +163,17 @@ struct lightningd {
 	/* PID file */
 	char *pidfile;
 
-	/* May be useful for non-developers debugging in the field */
-	char *debug_subdaemon_io;
-
-	/* Disable automatic reconnects */
-	bool no_reconnect;
-
 	/* Initial autocleaninvoice settings. */
 	u64 ini_autocleaninvoice_cycle;
 	u64 ini_autocleaninvoice_expiredby;
 
+	/* Number of blocks we wait for a channel to get funded
+	 * if we are the fundee. */
+	u32 max_funding_unconfirmed;
+
 #if DEVELOPER
 	/* If we want to debug a subdaemon. */
 	const char *dev_debug_subdaemon;
-
-	/* If we want to set a specific non-random HSM seed. */
-	const u8 *dev_hsm_seed;
 
 	/* If we have a --dev-disconnect file */
 	int dev_disconnect_fd;
@@ -173,9 +181,18 @@ struct lightningd {
 	/* If we have --dev-fail-on-subdaemon-fail */
 	bool dev_subdaemon_fail;
 
+	/* Allow and accept localhost node_announcement addresses */
+	bool dev_allow_localhost;
+
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
 #endif /* DEVELOPER */
+
+	/* tor support */
+	struct wireaddr *proxyaddr;
+	bool use_proxy_always;
+	char *tor_service_password;
+	bool pure_tor_setup;
 };
 
 const struct chainparams *get_chainparams(const struct lightningd *ld);
@@ -185,5 +202,8 @@ struct backtrace_state *backtrace_state;
 
 /* Check we can run subdaemons, and check their versions */
 void test_daemons(const struct lightningd *ld);
+
+/* Notify lightningd about new blocks. */
+void notify_new_block(struct lightningd *ld, u32 block_height);
 
 #endif /* LIGHTNING_LIGHTNINGD_LIGHTNINGD_H */

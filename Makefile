@@ -1,5 +1,7 @@
 #! /usr/bin/make
-
+VERSION_NAME=I Accidentally The Smart Contract
+VERSION=$(shell git describe --always --dirty=-modded --abbrev=7)
+DISTRO=$(shell lsb_release -is 2>/dev/null || echo unknown)-$(shell lsb_release -rs 2>/dev/null || echo unknown)
 PKGNAME = c-lightning
 
 # We use our own internal ccan copy.
@@ -7,23 +9,19 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 4f91f0bb2a9c176dda019f9c0618c10f9fa0acfd
+BOLTVERSION := fd9da9b95eb5d585252d7e749212151502e0cc17
 
-# If you don't have (working) valgrind.
-#NO_VALGRIND := 1
+-include config.vars
 
-ifneq ($(NO_VALGRIND),1)
-VALGRIND=valgrind -q --error-exitcode=7
-VALGRIND_TEST_ARGS = --track-origins=yes --leak-check=full --show-reachable=yes --errors-for-leak-kinds=all
+ifneq ($(VALGRIND),0)
+VG=valgrind -q --error-exitcode=7
+VG_TEST_ARGS = --track-origins=yes --leak-check=full --show-reachable=yes --errors-for-leak-kinds=all
 endif
 
-# By default, we are in DEVELOPER mode, use DEVELOPER= on cmdline to override.
-DEVELOPER := 1
-
 ifeq ($(DEVELOPER),1)
-DEV_CFLAGS=-DDEVELOPER=1 -DCCAN_TAL_DEBUG=1 -DCCAN_TAKE_DEBUG=1
+DEV_CFLAGS=-DCCAN_TAL_DEBUG=1 -DCCAN_TAKE_DEBUG=1
 else
-DEV_CFLAGS=-DDEVELOPER=0
+DEV_CFLAGS=
 endif
 
 ifeq ($(COVERAGE),1)
@@ -35,16 +33,12 @@ PIE_CFLAGS=-fPIE -fPIC
 PIE_LDFLAGS=-pie
 endif
 
-ifneq ($(NO_COMPAT),1)
+ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
 COMPAT_CFLAGS=-DCOMPAT_V052=1
 endif
 
-PYTEST := $(shell command -v pytest 2> /dev/null)
 PYTEST_OPTS := -v -x
-ifeq ($(TRAVIS),true)
-PYTEST_OPTS += --reruns=3
-endif
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -54,6 +48,7 @@ CCAN_OBJS :=					\
 	ccan-autodata.o				\
 	ccan-bitops.o				\
 	ccan-breakpoint.o			\
+	ccan-crc.o				\
 	ccan-crypto-hmac.o			\
 	ccan-crypto-hkdf.o			\
 	ccan-crypto-ripemd160.o			\
@@ -80,7 +75,9 @@ CCAN_OBJS :=					\
 	ccan-opt.o				\
 	ccan-pipecmd.o				\
 	ccan-ptr_valid.o			\
+	ccan-rbuf.o				\
 	ccan-read_write_all.o			\
+	ccan-str-base32.o			\
 	ccan-str-hex.o				\
 	ccan-str.o				\
 	ccan-take.o				\
@@ -90,7 +87,8 @@ CCAN_OBJS :=					\
 	ccan-tal-str.o				\
 	ccan-tal.o				\
 	ccan-time.o				\
-	ccan-timer.o
+	ccan-timer.o				\
+	ccan-utf8.o
 
 CCAN_HEADERS :=						\
 	$(CCANDIR)/config.h				\
@@ -107,6 +105,7 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/compiler/compiler.h		\
 	$(CCANDIR)/ccan/container_of/container_of.h	\
 	$(CCANDIR)/ccan/cppmagic/cppmagic.h		\
+	$(CCANDIR)/ccan/crc/crc.h			\
 	$(CCANDIR)/ccan/crypto/hkdf_sha256/hkdf_sha256.h \
 	$(CCANDIR)/ccan/crypto/hmac_sha256/hmac_sha256.h \
 	$(CCANDIR)/ccan/crypto/ripemd160/ripemd160.h	\
@@ -137,8 +136,10 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/pipecmd/pipecmd.h		\
 	$(CCANDIR)/ccan/ptr_valid/ptr_valid.h		\
 	$(CCANDIR)/ccan/ptrint/ptrint.h			\
+	$(CCANDIR)/ccan/rbuf/rbuf.h			\
 	$(CCANDIR)/ccan/read_write_all/read_write_all.h	\
 	$(CCANDIR)/ccan/short_types/short_types.h	\
+	$(CCANDIR)/ccan/str/base32/base32.h		\
 	$(CCANDIR)/ccan/str/hex/hex.h			\
 	$(CCANDIR)/ccan/str/str.h			\
 	$(CCANDIR)/ccan/str/str_debug.h			\
@@ -153,7 +154,8 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/tcon/tcon.h			\
 	$(CCANDIR)/ccan/time/time.h			\
 	$(CCANDIR)/ccan/timer/timer.h			\
-	$(CCANDIR)/ccan/typesafe_cb/typesafe_cb.h
+	$(CCANDIR)/ccan/typesafe_cb/typesafe_cb.h	\
+	$(CCANDIR)/ccan/utf8/utf8.h
 
 ALL_GEN_HEADERS += gen_version.h
 
@@ -172,9 +174,13 @@ CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLU
 CONFIGURATOR_CC := $(CC)
 
 LDFLAGS = $(PIE_LDFLAGS)
-LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 $(COVFLAGS)
+LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
 
 default: all-programs all-test-programs
+
+config.vars ccan/config.h: configure
+	@if [ ! -f config.vars ]; then echo 'The 1990s are calling: use ./configure!' >&2; exit 1; fi
+	./configure --reconfigure
 
 include external/Makefile
 include bitcoin/Makefile
@@ -195,9 +201,12 @@ include devtools/Makefile
 # Git doesn't maintain timestamps, so we only regen if git says we should.
 CHANGED_FROM_GIT = [ x"`git log $@ | head -n1`" != x"`git log $< | head -n1`" -o x"`git diff $<`" != x"" ]
 
-ifeq ($(TEST_GROUP_COUNT),)
-TEST_GROUP=1
-TEST_GROUP_COUNT=1
+ifneq ($(TEST_GROUP_COUNT),)
+PYTEST_OPTS += --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
+endif
+
+ifneq ($(PYTEST_PAR),)
+PYTEST_OPTS += -n=$(PYTEST_PAR)
 endif
 
 check:
@@ -206,9 +215,11 @@ check:
 
 pytest: $(ALL_PROGRAMS)
 ifndef PYTEST
-	PYTHONPATH=contrib/pylightning:$$PYTHONPATH DEVELOPER=$(DEVELOPER) python3 tests/test_lightningd.py -f
+	@echo "py.test is required to run the integration tests, please install using 'pip3 install -r tests/requirements.txt'"
+	exit 1
 else
-	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) $(PYTEST) -vx tests/test_lightningd.py --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT) $(PYTEST_OPTS)
+# Explicitly hand DEVELOPER and VALGRIND so you can override on make cmd line.
+	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -233,7 +244,7 @@ bolt-precheck:
 
 check-source-bolt: $(ALL_TEST_PROGRAMS:%=bolt-check/%.c)
 
-tools/check-bolt: tools/check-bolt.o $(CCAN_OBJS)
+tools/check-bolt: tools/check-bolt.o $(CCAN_OBJS) common/utils.o
 
 tools/check-bolt.o: $(CCAN_HEADERS)
 
@@ -268,7 +279,13 @@ check-cppcheck: .cppcheck-suppress
 check-shellcheck:
 	git ls-files -- "*.sh" | xargs shellcheck
 
-check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python check-includes check-cppcheck check-shellcheck
+check-setup_locale:
+	@tools/check-setup_locale.sh
+
+check-tmpctx:
+	@if git grep -n 'tal_free[(]tmpctx)' | grep -Ev '^ccan/|/test/|^common/daemon.c:|^common/utils.c:'; then echo "Don't free tmpctx!">&2; exit 1; fi
+
+check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python check-includes check-cppcheck check-shellcheck check-setup_locale check-tmpctx
 
 full-check: check check-source
 
@@ -278,6 +295,11 @@ coverage/coverage.info: check pytest
 
 coverage: coverage/coverage.info
 	genhtml coverage/coverage.info --output-directory coverage
+
+# We make libwallycore.la a dependency, so that it gets built normally, without ncc.
+# Ncc can't handle the libwally source code (yet).
+ncc: external/libwally-core/src/libwallycore.la
+	make CC="ncc -ncgcc -ncld -ncfabs" AR=nccar LD=nccld
 
 # Ignore test/ directories.
 TAGS: FORCE
@@ -290,11 +312,8 @@ ALL_PROGRAMS += ccan/ccan/cdump/tools/cdump-enumstr
 # Can't add to ALL_OBJS, as that makes a circular dep.
 ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 
-ccan/config.h: ccan/tools/configurator/configurator Makefile
-	if $< --configurator-cc="$(CONFIGURATOR_CC)" $(CC) $(CFLAGS) > $@.new; then mv $@.new $@; else rm $@.new; exit 1; fi
-
 gen_version.h: FORCE
-	@(echo "#define VERSION \"`git describe --always --dirty=-with-local-modifications`\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
+	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
 	@if cmp $@.new $@ >/dev/null 2>&2; then rm -f $@.new; else mv $@.new $@; echo Version updated; fi
 
 # All binaries require the external libs, ccan
@@ -323,17 +342,19 @@ update-ccan:
 	mv ccan ccan.old
 	DIR=$$(pwd)/ccan; cd ../ccan && ./tools/create-ccan-tree -a $$DIR `cd $$DIR.old/ccan && find * -name _info | sed s,/_info,, | sort` $(CCAN_NEW)
 	mkdir -p ccan/tools/configurator
-	cp ../ccan/tools/configurator/configurator.c ccan/tools/configurator/
+	cp ../ccan/tools/configurator/configurator.c ../ccan/doc/configurator.1 ccan/tools/configurator/
 	$(MAKE) ccan/config.h
 	grep -v '^CCAN version:' ccan.old/README > ccan/README
 	echo CCAN version: `git -C ../ccan describe` >> ccan/README
 	$(RM) -r ccan.old
+	$(RM) -r ccan/ccan/hash/ ccan/ccan/tal/talloc/	# Unnecessary deps
 
 # Now ALL_PROGRAMS is fully populated, we can expand it.
 all-programs: $(ALL_PROGRAMS)
 all-test-programs: $(ALL_TEST_PROGRAMS)
 
 distclean: clean
+	$(RM) ccan/config.h config.vars
 
 maintainer-clean: distclean
 	@echo 'This command is intended for maintainers to use; it'
@@ -343,17 +364,18 @@ clean: wire-clean
 	$(RM) $(CCAN_OBJS) $(CDUMP_OBJS) $(ALL_OBJS)
 	$(RM) $(ALL_PROGRAMS) $(ALL_PROGRAMS:=.o)
 	$(RM) $(ALL_TEST_PROGRAMS) $(ALL_TEST_PROGRAMS:=.o)
-	$(RM) ccan/config.h gen_*.h ccan/tools/configurator/configurator
+	$(RM) gen_*.h ccan/tools/configurator/configurator
 	$(RM) ccan/ccan/cdump/tools/cdump-enumstr.o
 	$(RM) check-bolt tools/check-bolt tools/*.o
 	find . -name '*gcda' -delete
 	find . -name '*gcno' -delete
+	find . -name '*.nccout' -delete
 
 update-mocks/%: %
 	@tools/update-mocks.sh "$*"
 
 unittest/%: %
-	$(VALGRIND) $(VALGRIND_TEST_ARGS) $*
+	$(VG) $(VG_TEST_ARGS) $* > /dev/null
 
 # Installation directories
 prefix = /usr/local
@@ -456,7 +478,14 @@ installcheck:
 	@rm -rf testinstall || true
 
 .PHONY: installdirs install-program install-data install uninstall \
-	installcheck
+	installcheck ncc bin-tarball
+
+# Make a tarball of opt/clightning/, optionally with label for distribution.
+bin-tarball: clightning-$(VERSION)-$(DISTRO).tar.xz
+clightning-$(VERSION)-$(DISTRO).tar.xz: DESTDIR=$(shell pwd)/
+clightning-$(VERSION)-$(DISTRO).tar.xz: prefix=opt/clightning
+clightning-$(VERSION)-$(DISTRO).tar.xz: install
+	trap "rm -rf opt" 0; tar cvfa $@ opt/
 
 ccan-breakpoint.o: $(CCANDIR)/ccan/breakpoint/breakpoint.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -499,6 +528,8 @@ ccan-err.o: $(CCANDIR)/ccan/err/err.c
 ccan-noerr.o: $(CCANDIR)/ccan/noerr/noerr.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-str-hex.o: $(CCANDIR)/ccan/str/hex/hex.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-crc.o: $(CCANDIR)/ccan/crc/crc.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-crypto-hmac.o: $(CCANDIR)/ccan/crypto/hmac_sha256/hmac_sha256.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -543,4 +574,10 @@ ccan-mem.o: $(CCANDIR)/ccan/mem/mem.c
 ccan-fdpass.o: $(CCANDIR)/ccan/fdpass/fdpass.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-bitops.o: $(CCANDIR)/ccan/bitops/bitops.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-rbuf.o: $(CCANDIR)/ccan/rbuf/rbuf.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-str-base32.o: $(CCANDIR)/ccan/str/base32/base32.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-utf8.o: $(CCANDIR)/ccan/utf8/utf8.c
 	$(CC) $(CFLAGS) -c -o $@ $<
