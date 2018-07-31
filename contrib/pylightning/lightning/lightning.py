@@ -3,6 +3,12 @@ import logging
 import socket
 
 
+class RpcError(ValueError):
+    def __init__(self, description, error=None):
+        super(ValueError, self).__init__(description)
+        self.error = error
+
+
 class UnixDomainSocketRpc(object):
     def __init__(self, socket_path, executor=None, logger=logging):
         self.socket_path = socket_path
@@ -63,12 +69,12 @@ class UnixDomainSocketRpc(object):
 
         self.logger.debug("Received response for %s call: %r", method, resp)
         if "error" in resp:
-            raise ValueError(
-                "RPC call failed: {}, method: {}, payload: {}".format(
-                    resp["error"],
+            raise RpcError(
+                "RPC call failed: method: {}, payload: {}, error: {}".format(
                     method,
-                    payload
-                ))
+                    payload,
+                    resp['error']
+                ), resp['error'])
         elif "result" not in resp:
             raise ValueError("Malformed response, \"result\" missing.")
         return resp["result"]
@@ -98,12 +104,6 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         res = self.call("listpeers", payload)
         return res.get("peers") and res["peers"][0] or None
-
-    def dev_blockheight(self):
-        """
-        Show current block height
-        """
-        return self.call("dev-blockheight")
 
     def dev_setfees(self, immediate=None, normal=None, slow=None):
         """
@@ -150,7 +150,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listchannels", payload)
 
-    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None):
+    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None):
         """
         Create an invoice for {msatoshi} with {label} and {description} with
         optional {expiry} seconds (default 1 hour)
@@ -160,7 +160,8 @@ class LightningRpc(UnixDomainSocketRpc):
             "label": label,
             "description": description,
             "expiry": expiry,
-            "fallbacks": fallbacks
+            "fallbacks": fallbacks,
+            "preimage": preimage
         }
         return self.call("invoice", payload)
 
@@ -247,6 +248,16 @@ class LightningRpc(UnixDomainSocketRpc):
         Crash lightningd by calling fatal()
         """
         return self.call("dev-crash")
+
+    def dev_query_scids(self, id, scids):
+        """
+        Ask peer for a particular set of scids
+        """
+        payload = {
+            "id": id,
+            "scids": scids
+        }
+        return self.call("dev-query-scids", payload)
 
     def getinfo(self):
         """

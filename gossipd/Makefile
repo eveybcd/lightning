@@ -7,25 +7,28 @@ gossipd-wrongdir:
 default: gossipd-all
 
 # Control daemon uses this:
-LIGHTNINGD_GOSSIP_CONTROL_HEADERS := gossipd/gen_gossip_wire.h
+LIGHTNINGD_GOSSIP_CONTROL_HEADERS := gossipd/gen_gossip_wire.h gossipd/gossip_constants.h
 LIGHTNINGD_GOSSIP_CONTROL_SRC := gossipd/gen_gossip_wire.c
 LIGHTNINGD_GOSSIP_CONTROL_OBJS := $(LIGHTNINGD_GOSSIP_CONTROL_SRC:.c=.o)
 
 # gossipd needs these:
 LIGHTNINGD_GOSSIP_HEADERS := gossipd/gen_gossip_wire.h \
+	gossipd/gossip.h				\
 	gossipd/gen_gossip_store.h			\
 	gossipd/gossip_store.h				\
 	gossipd/handshake.h				\
+	gossipd/netaddress.h				\
 	gossipd/routing.h				\
+	gossipd/tor_autoservice.h			\
+	gossipd/tor.h					\
 	gossipd/broadcast.h
-LIGHTNINGD_GOSSIP_SRC := gossipd/gossip.c	\
-	$(LIGHTNINGD_GOSSIP_HEADERS:.h=.c)
+LIGHTNINGD_GOSSIP_SRC := $(LIGHTNINGD_GOSSIP_HEADERS:.h=.c)
 LIGHTNINGD_GOSSIP_OBJS := $(LIGHTNINGD_GOSSIP_SRC:.c=.o)
 
 # Make sure these depend on everything.
 ALL_OBJS += $(LIGHTNINGD_GOSSIP_OBJS)
 ALL_PROGRAMS += lightningd/lightning_gossipd
-ALL_GEN_HEADERS += $(LIGHTNINGD_GOSSIP_CONTROL_HEADERS)
+ALL_GEN_HEADERS += gossipd/gen_gossip_wire.h
 
 # For checking
 LIGHTNINGD_GOSSIP_ALLSRC_NOGEN := $(filter-out gossipd/gen_%, $(LIGHTNINGD_GOSSIP_CLIENT_SRC) $(LIGHTNINGD_GOSSIP_SRC))
@@ -36,12 +39,16 @@ LIGHTNINGD_HEADERS_GEN += $(LIGHTNINGD_GOSSIP_HEADERS)
 
 # Common source we use.
 GOSSIPD_COMMON_OBJS :=				\
+	common/base32.o				\
+	common/bech32.o				\
+	common/bech32_util.o			\
 	common/bip32.o				\
 	common/crypto_state.o			\
 	common/crypto_sync.o			\
 	common/cryptomsg.o			\
 	common/daemon.o				\
 	common/daemon_conn.o			\
+	common/decode_short_channel_ids.o	\
 	common/dev_disconnect.o			\
 	common/features.o			\
 	common/gen_status_wire.o		\

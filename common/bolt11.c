@@ -5,9 +5,9 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/endian/endian.h>
-#include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
+#include <common/bech32_util.h>
 #include <common/bolt11.h>
 #include <common/utils.h>
 #include <errno.h>
@@ -140,8 +140,8 @@ static char *unknown_field(struct bolt11 *b11,
 
 /* BOLT #11:
  *
- * `p` (1): `data_length` 52.  256-bit SHA256 payment_hash: preimage of this
- * provides proof of payment.
+ * `p` (1): `data_length` 52.  256-bit SHA256 payment_hash.  Preimage of this
+ * provides proof of payment
  */
 static void decode_p(struct bolt11 *b11,
                      struct hash_u5 *hu5,
@@ -150,8 +150,8 @@ static void decode_p(struct bolt11 *b11,
 {
         /* BOLT #11:
          *
-         * A payer SHOULD use the first `p` field did not skip as the payment
-         * hash.
+         * A payer SHOULD use the first `p` field that it did not skip as the
+         * payment hash.
          */
         if (*have_p) {
                 unknown_field(b11, hu5, data, data_len, 'p', data_length);
@@ -161,7 +161,7 @@ static void decode_p(struct bolt11 *b11,
         /* BOLT #11:
          *
          * A reader MUST skip over unknown fields, an `f` field with unknown
-         * `version`, or a `p`, `h`, or `n` field which does not have
+         * `version`, or a `p`, `h`, or `n` field that does not have
          * `data_length` 52, 52, or 53 respectively. */
         if (data_length != 52) {
                 unknown_field(b11, hu5, data, data_len, 'p', data_length);
@@ -174,8 +174,8 @@ static void decode_p(struct bolt11 *b11,
 
 /* BOLT #11:
  *
- * `d` (13): `data_length` variable.  short description of purpose of payment
- * (ASCII), e.g. '1 cup of coffee'
+ * `d` (13): `data_length` variable.  Short description of purpose of payment
+ * (UTF-8), e.g. '1 cup of coffee' or 'ナンセンス 1杯'
  */
 static void decode_d(struct bolt11 *b11,
                      struct hash_u5 *hu5,
@@ -196,8 +196,9 @@ static void decode_d(struct bolt11 *b11,
 /* BOLT #11:
  *
  * `h` (23): `data_length` 52.  256-bit description of purpose of payment
- * (SHA256).  This is used to commit to an associated description which is too
- * long to fit, such as may be contained in a web page.
+ * (SHA256).  This is used to commit to an associated description that is over
+ * 639 bytes, but the transport mechanism for the description in that case is
+ * transport specific and not defined here.
  */
 static void decode_h(struct bolt11 *b11,
                      struct hash_u5 *hu5,
@@ -212,7 +213,7 @@ static void decode_h(struct bolt11 *b11,
         /* BOLT #11:
          *
          * A reader MUST skip over unknown fields, an `f` field with unknown
-         * `version`, or a `p`, `h`, or `n` field which does not have
+         * `version`, or a `p`, `h`, or `n` field that does not have
          * `data_length` 52, 52, or 53 respectively. */
         if (data_length != 52) {
                 unknown_field(b11, hu5, data, data_len, 'h', data_length);
@@ -289,7 +290,7 @@ static char *decode_n(struct bolt11 *b11,
         /* BOLT #11:
          *
          * A reader MUST skip over unknown fields, an `f` field with unknown
-         * `version`, or a `p`, `h`, or `n` field which does not have
+         * `version`, or a `p`, `h`, or `n` field that does not have
          * `data_length` 52, 52, or 53 respectively. */
         if (data_length != 53)
                 return unknown_field(b11, hu5, data, data_len, 'n',
@@ -307,8 +308,8 @@ static char *decode_n(struct bolt11 *b11,
 /* BOLT #11:
  *
  * `f` (9): `data_length` variable, depending on version. Fallback on-chain
- * address: for bitcoin, this starts with a 5 bit `version`; a witness program
- * or P2PKH or P2SH address.
+ * address: for bitcoin, this starts with a 5-bit `version` and contains a
+ * witness program or P2PKH or P2SH address.
  */
 static char *decode_f(struct bolt11 *b11,
                       struct hash_u5 *hu5,
@@ -398,7 +399,7 @@ static void towire_route_info(u8 **pptr, const struct route_info *route_info)
  *
  * `r` (3): `data_length` variable.  One or more entries containing
  * extra routing information for a private route; there may be more
- * than one `r` field, too.
+ * than one `r` field
  *
  *   * `pubkey` (264 bits)
  *   * `short_channel_id` (64 bits)
@@ -485,10 +486,13 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
         /* BOLT #11:
          *
-         * The human readable part consists of two sections:
-         * 1. `prefix`: `ln` + BIP-0173 currency prefix (e.g. `lnbc`, `lntb`)
-         * 1. `amount`: optional number in that currency, followed by optional
-         *    `multiplier`.
+         * The human-readable part of a Lightning invoice consists of two
+	 * sections:
+	 * 1. `prefix`: `ln` + BIP-0173 currency prefix (e.g. `lnbc` for bitcoin
+	 *     mainnet, `lntb` for bitcoin testnet and `lnbcrt` for bitcoin
+	 *     regtest)
+         * 1. `amount`: optional number in that currency, followed by an optional
+         *    `multiplier` letter
          */
         prefix = tal_strndup(tmpctx, hrp, strcspn(hrp, "0123456789"));
 
@@ -506,7 +510,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
         /* BOLT #11:
          *
-         * A reader SHOULD fail if `amount` contains a non-digit, or
+         * A reader SHOULD fail if `amount` contains a non-digit or
          * is followed by anything except a `multiplier` in the table
          * above. */
         amountstr = tal_strdup(tmpctx, hrp + strlen(prefix));
@@ -533,7 +537,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
                 /* BOLT #11:
                  *
-                 * A reader SHOULD fail if `amount` contains a non-digit, or
+                 * A reader SHOULD fail if `amount` contains a non-digit or
                  * is followed by anything except a `multiplier` in the table
                  * above.
                  */
@@ -552,11 +556,11 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
         /* BOLT #11:
          *
-         * The data part consists of multiple sections:
+         * The data part of a Lightning invoice consists of multiple sections:
          *
          * 1. `timestamp`: seconds-since-1970 (35 bits, big-endian)
-         * 1. Zero or more tagged parts.
-         * 1. `signature`: bitcoin-style signature of above. (520 bits)
+         * 1. zero or more tagged parts
+         * 1. `signature`: bitcoin-style signature of above (520 bits)
          */
         if (!pull_uint(&hu5, &data, &data_len, &b11->timestamp, 35))
                 return decode_fail(b11, fail, "Can't get 35-bit timestamp");
@@ -567,7 +571,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 
                 /* BOLT #11:
                  *
-                 * Each Tagged Field is of format:
+                 * Each Tagged Field is of the form:
                  *
                  * 1. `type` (5 bits)
                  * 1. `data_length` (10 bits, big-endian)
@@ -648,7 +652,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
                         return decode_fail(b11, fail,
                                            "h: no description to check");
                 sha256(&sha, description, strlen(description));
-                if (!structeq(b11->description_hash, &sha))
+                if (!sha256_eq(b11->description_hash, &sha))
                         return decode_fail(b11, fail,
                                            "h: does not match description");
         }
@@ -658,10 +662,11 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
         /* BOLT #11:
          *
          * A writer MUST set `signature` to a valid 512-bit secp256k1
-         * signature of the SHA2 256-bit hash of the Human Readable Part
-         * concatenated with the Data Part and zero bits appended to the next
-         * byte boundary, with a trailing byte containing the recovery ID (0,
-         * 1, 2 or 3).
+         * signature of the SHA2 256-bit hash of the human-readable part,
+         * represented as UTF-8 bytes, concatenated with the data part
+         * (excluding the signature) with zero bits appended to pad the data
+         * to the next byte boundary, with a trailing byte containing the
+         * recovery ID (0, 1, 2 or 3).
          */
         if (!pull_bits(NULL, &data, &data_len, sig_and_recid, 520, false))
                 return decode_fail(b11, fail, "signature truncated");
@@ -700,40 +705,16 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
         return b11;
 }
 
-static u8 get_bit(const u8 *src, size_t bitoff)
-{
-        return ((src[bitoff / 8] >> (7 - (bitoff % 8))) & 1);
-}
-
-/* Returns now many u5s were appended. */
-static void push_bits(u5 **data, const void *src, size_t nbits)
-{
-        size_t i, b;
-        size_t data_len = tal_len(*data);
-
-        for (i = 0; i < nbits; i += b) {
-                tal_resize(data, data_len+1);
-                (*data)[data_len] = 0;
-                for (b = 0; b < 5; b++) {
-                        (*data)[data_len] <<= 1;
-                        /* If we need bits we don't have, zero */
-                        if (i+b < nbits)
-                                (*data)[data_len] |= get_bit(src, i+b);
-                }
-                data_len++;
-        }
-}
-
 /* Helper for pushing a variable-length big-endian int. */
 static void push_varlen_uint(u5 **data, u64 val, size_t nbits)
 {
         be64 be_val = cpu_to_be64(val << (64 - nbits));
-        push_bits(data, &be_val, nbits);
+        bech32_push_bits(data, &be_val, nbits);
 }
 
 /* BOLT #11:
  *
- * Each Tagged Field is of format:
+ * Each Tagged Field is of the form:
  *
  * 1. `type` (5 bits)
  * 1. `data_length` (10 bits, big-endian)
@@ -744,7 +725,7 @@ static void push_field(u5 **data, char type, const void *src, size_t nbits)
         assert(bech32_charset_rev[(unsigned char)type] >= 0);
         push_varlen_uint(data, bech32_charset_rev[(unsigned char)type], 5);
         push_varlen_uint(data, (nbits + 4) / 5, 10);
-        push_bits(data, src, nbits);
+        bech32_push_bits(data, src, nbits);
 }
 
 /* BOLT #11:
@@ -769,19 +750,17 @@ static void push_varlen_field(u5 **data, char type, u64 val)
 
 /* BOLT #11:
  *
- * The fallback field is of format:
+ * `f` (9): `data_length` variable, depending on version.
  *
- * 1. `type` (5 bits)
- * 2. `data_length` (10 bits, big-endian)
- * 3. `version` (5 bits)
- * 4. `data` (addr_len * 8 bits)
+ * Fallback on-chain address: for bitcoin, this starts with a 5-bit `version`
+ * and contains a witness program or P2PKH or P2SH address.
  */
 static void push_fallback_addr(u5 **data, u5 version, const void *addr, u16 addr_len)
 {
         push_varlen_uint(data, bech32_charset_rev[(unsigned char)'f'], 5);
         push_varlen_uint(data, ((5 + addr_len * CHAR_BIT) + 4) / 5, 10);
         push_varlen_uint(data, version, 5);
-        push_bits(data, addr, addr_len * CHAR_BIT);
+        bech32_push_bits(data, addr, addr_len * CHAR_BIT);
 }
 
 static void encode_p(u5 **data, const struct sha256 *hash)
@@ -895,8 +874,8 @@ char *bolt11_encode_(const tal_t *ctx,
         /* BOLT #11:
          *
          * A writer MUST encode `amount` as a positive decimal integer
-         * with no leading zeroes, SHOULD use the shortest
-         * representation possible.
+         * with no leading zeroes and SHOULD use the shortest representation
+	 * possible.
          */
         if (b11->msatoshi) {
                 char postfix;
@@ -920,8 +899,8 @@ char *bolt11_encode_(const tal_t *ctx,
         /* BOLT #11:
          *
          * 1. `timestamp`: seconds-since-1970 (35 bits, big-endian)
-         * 1. Zero or more tagged parts.
-         * 1. `signature`: bitcoin-style signature of above. (520 bits)
+         * 1. zero or more tagged parts
+         * 1. `signature`: bitcoin-style signature of above (520 bits)
          */
         push_varlen_uint(&data, b11->timestamp, 35);
 
@@ -974,7 +953,7 @@ char *bolt11_encode_(const tal_t *ctx,
                 &rsig);
         sig_and_recid[64] = recid;
 
-        push_bits(&data, sig_and_recid, sizeof(sig_and_recid) * CHAR_BIT);
+        bech32_push_bits(&data, sig_and_recid, sizeof(sig_and_recid) * CHAR_BIT);
 
         output = tal_arr(ctx, char, strlen(hrp) + tal_count(data) + 8);
         if (!bech32_encode(output, hrp, data, tal_count(data), (size_t)-1))

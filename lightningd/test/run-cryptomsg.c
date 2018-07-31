@@ -46,7 +46,7 @@ void status_fmt(enum log_level level UNUSED, const char *fmt, ...)
 	va_end(ap);
 }
 
-void status_io(enum log_level dir UNUSED, const u8 *msg UNUSED)
+void status_peer_io(enum log_level dir UNUSED, const u8 *msg UNUSED)
 {
 }
 
@@ -98,6 +98,8 @@ static struct secret secret_from_hex(const char *hex)
 
 int main(void)
 {
+	setup_locale();
+
 	struct peer_crypto_state cs_out, cs_in;
 	struct secret sk, rk, ck;
 	const void *msg;

@@ -1,5 +1,7 @@
 COMMON_SRC_NOGEN :=				\
+	common/base32.c				\
 	common/bech32.c				\
+	common/bech32_util.c			\
 	common/bip32.c				\
 	common/bolt11.c				\
 	common/channel_config.c			\
@@ -10,6 +12,7 @@ COMMON_SRC_NOGEN :=				\
 	common/cryptomsg.c			\
 	common/daemon.c				\
 	common/daemon_conn.c			\
+	common/decode_short_channel_ids.c	\
 	common/derive_basepoints.c		\
 	common/dev_disconnect.c			\
 	common/features.c			\
@@ -32,6 +35,7 @@ COMMON_SRC_NOGEN :=				\
 	common/ping.c				\
 	common/pseudorand.c			\
 	common/read_peer_msg.c			\
+	common/socket_close.c			\
 	common/sphinx.c				\
 	common/status.c				\
 	common/status_wire.c			\
@@ -41,6 +45,7 @@ COMMON_SRC_NOGEN :=				\
 	common/utils.c				\
 	common/utxo.c				\
 	common/version.c			\
+	common/wallet_tx.c			\
 	common/wireaddr.c			\
 	common/wire_error.c			\
 	common/withdraw_tx.c

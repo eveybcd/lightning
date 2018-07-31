@@ -27,9 +27,11 @@
 #include <fcntl.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/channel_control.h>
 #include <lightningd/invoice.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
+#include <lightningd/onchain_control.h>
 #include <lightningd/options.h>
 #include <onchaind/onchain_wire.h>
 #include <signal.h>
@@ -49,9 +51,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 #if DEVELOPER
 	ld->dev_debug_subdaemon = NULL;
 	ld->dev_disconnect_fd = -1;
-	ld->dev_hsm_seed = NULL;
 	ld->dev_subdaemon_fail = false;
-	ld->no_reconnect = false;
+	ld->dev_allow_localhost = false;
 
 	if (getenv("LIGHTNINGD_DEV_MEMLEAK"))
 		memleak_init(ld, backtrace_state);
@@ -66,18 +67,27 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->alias = NULL;
 	ld->rgb = NULL;
 	list_head_init(&ld->connects);
+	list_head_init(&ld->fundchannels);
 	list_head_init(&ld->waitsendpay_commands);
 	list_head_init(&ld->sendpay_commands);
 	list_head_init(&ld->close_commands);
-	ld->wireaddrs = tal_arr(ld, struct wireaddr, 0);
+	ld->proposed_wireaddr = tal_arr(ld, struct wireaddr_internal, 0);
+	ld->proposed_listen_announce = tal_arr(ld, enum addr_listen_announce, 0);
 	ld->portnum = DEFAULT_PORT;
+	ld->listen = true;
+	ld->autolisten = true;
+	ld->reconnect = true;
 	timers_init(&ld->timers, time_mono());
 	ld->topology = new_topology(ld, ld->log);
-	ld->debug_subdaemon_io = NULL;
 	ld->daemon = false;
 	ld->pidfile = NULL;
 	ld->ini_autocleaninvoice_cycle = 0;
 	ld->ini_autocleaninvoice_expiredby = 86400;
+	ld->proxyaddr = NULL;
+	ld->use_proxy_always = false;
+	ld->pure_tor_setup = false;
+	ld->tor_service_password = NULL;
+	ld->max_funding_unconfirmed = 2016;
 
 	return ld;
 }
@@ -208,8 +218,12 @@ static void shutdown_subdaemons(struct lightningd *ld)
 			tal_free(c);
 		}
 
-		/* Removes itself from list as we free it */
-		tal_free(p);
+		/* Freeing uncommitted channel will free peer. */
+		if (p->uncommitted_channel)
+			tal_free(p->uncommitted_channel);
+		else
+			/* Removes itself from list as we free it */
+			tal_free(p);
 	}
 	db_commit_transaction(ld->wallet->db);
 }
@@ -272,12 +286,29 @@ static void pidfile_create(const struct lightningd *ld)
 	write_all(pid_fd, pid, strlen(pid));
 }
 
+/* Yuck, we need globals here. */
+static int (*io_poll_debug)(struct pollfd *, nfds_t, int);
+static int io_poll_lightningd(struct pollfd *fds, nfds_t nfds, int timeout)
+{
+	db_assert_no_outstanding_statements();
+
+	return io_poll_debug(fds, nfds, timeout);
+}
+
+void notify_new_block(struct lightningd *ld,
+		      u32 block_height)
+{
+	/* Inform our subcomponents individually. */
+	htlcs_notify_new_block(ld, block_height);
+	channel_notify_new_block(ld, block_height);
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
-	bool newdir;
-	u32 first_blocknum;
+	u32 min_blockheight, max_blockheight;
 
+	setup_locale();
 	daemon_setup(argv[0], log_backtrace_print, log_backtrace_exit);
 	ld = new_lightningd(NULL);
 
@@ -289,7 +320,7 @@ int main(int argc, char *argv[])
 	register_opts(ld);
 
 	/* Handle options and config; move to .lightningd */
-	newdir = handle_opts(ld, argc, argv);
+	handle_opts(ld, argc, argv);
 
 	/* Ignore SIGPIPE: we look at our write return values*/
 	signal(SIGPIPE, SIG_IGN);
@@ -302,11 +333,17 @@ int main(int argc, char *argv[])
 	ld->owned_txfilter = txfilter_new(ld);
 	ld->topology->wallet = ld->wallet;
 
+	/* We do extra checks in io_loop. */
+	io_poll_debug = io_poll_override(io_poll_lightningd);
+
 	/* Set up HSM. */
-	hsm_init(ld, newdir);
+	hsm_init(ld);
 
 	/* Now we know our ID, we can set our color/alias if not already. */
 	setup_color_and_alias(ld);
+
+	/* Set up gossip daemon. */
+	gossip_init(ld);
 
 	/* Everything is within a transaction. */
 	db_begin_transaction(ld->wallet->db);
@@ -326,9 +363,6 @@ int main(int argc, char *argv[])
 	wallet_invoice_autoclean(ld->wallet,
 				 ld->ini_autocleaninvoice_cycle,
 				 ld->ini_autocleaninvoice_expiredby);
-
-	/* Set up gossip daemon. */
-	gossip_init(ld);
 
 	/* Load peers from database */
 	if (!wallet_channels_load_active(ld, ld->wallet))
@@ -351,18 +385,25 @@ int main(int argc, char *argv[])
 	if (!wallet_htlcs_reconnect(ld->wallet, &ld->htlcs_in, &ld->htlcs_out))
 		fatal("could not reconnect htlcs loaded from wallet, wallet may be inconsistent.");
 
-	/* Worst case, scan back to the first lightning deployment */
-	first_blocknum = wallet_first_blocknum(ld->wallet,
-					       get_chainparams(ld)
-					       ->when_lightning_became_cool);
+	/* Get the blockheight we are currently at, UINT32_MAX is used to signal
+	 * an unitialized wallet and that we should start off of bitcoind's
+	 * current height */
+	wallet_blocks_heights(ld->wallet, UINT32_MAX, &min_blockheight, &max_blockheight);
+
+	/* If we were asked to rescan from an absolute height (--rescan < 0)
+	 * then just go there. Otherwise compute the diff to our current height,
+	 * lowerbounded by 0. */
+	if (ld->config.rescan < 0)
+		max_blockheight = -ld->config.rescan;
+	else if (max_blockheight < (u32)ld->config.rescan)
+		max_blockheight = 0;
+	else if (max_blockheight != UINT32_MAX)
+		max_blockheight -= ld->config.rescan;
 
 	db_commit_transaction(ld->wallet->db);
 
 	/* Initialize block topology (does its own transaction) */
-	setup_topology(ld->topology,
-		       &ld->timers,
-		       ld->config.poll_time,
-		       first_blocknum);
+	setup_topology(ld->topology, &ld->timers, min_blockheight, max_blockheight);
 
 	/* Create RPC socket (if any) */
 	setup_jsonrpc(ld, ld->rpc_filename);
@@ -373,6 +414,13 @@ int main(int argc, char *argv[])
 
 	/* Create PID file */
 	pidfile_create(ld);
+
+	/* Activate gossip daemon. Needs to be after the initialization of
+	 * chaintopology, otherwise we may be asking for uninitialized data. */
+	gossip_activate(ld);
+
+	/* Replay transactions for all running onchainds */
+	onchaind_replay_channels(ld);
 
 	/* Mark ourselves live. */
 	log_info(ld->log, "Server started with public key %s, alias %s (color #%s) and lightningd %s",

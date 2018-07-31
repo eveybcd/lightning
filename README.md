@@ -2,7 +2,7 @@
 
 c-lightning is a [standard compliant][std] implementation of the Lightning
 Network protocol.
-The Lightning Network is a scalability solution for Bitcoin, enabling
+The Lightning Network is a scalability solution for BitcoinDiamond, enabling
 secure and instant transfer of funds between any two parties for any
 amount.
 
@@ -11,41 +11,11 @@ amount.
 For more information about the Lightning Network please refer to
 http://lightning.network.
 
-## Project Status
-
-[![Build Status][travis-ci]][travis-ci-link]
-[![Pull Requests Welcome][prs]][prs-link]
-[![Irc][IRC]][IRC-link]
-
-[travis-ci]: https://travis-ci.org/ElementsProject/lightning.svg?branch=master
-[travis-ci-link]: https://travis-ci.org/ElementsProject/lightning
-[prs]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
-[prs-link]: http://makeapullrequest.com
-[IRC]: https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg
-[IRC-link]: https://webchat.freenode.net/?channels=c-lightning
-
-This implementation is still very much a work in progress.
-It can be used for testing, but __it should not be used for real funds__.
-We do our best to identify and fix problems, and implement missing
-features.
-
-Any help testing the implementation, reporting bugs, or helping with
-outstanding issues is very welcome.
-Don't hesitate to reach out to us on IRC at
-[#lightning-dev @ freenode.net][irc1], [#c-lightning @
-freenode.net][irc2], or on the implementation-specific mailing list
-[c-lightning@lists.ozlabs.org][ml1], or on the Lightning Network-wide
-mailing list [lightning-dev@lists.linuxfoundation.org][ml2].
-
-[irc1]: http://webchat.freenode.net/?channels=%23lightning-dev
-[irc2]: http://webchat.freenode.net/?channels=%23c-lightning
-[ml1]: https://lists.ozlabs.org/listinfo/c-lightning
-[ml2]: https://lists.linuxfoundation.org/mailman/listinfo/lightning-dev
 
 ## Getting Started
 
 c-lightning currently only works on Linux (and possibly Mac OS with some
-tweaking), and requires a locally running `bitcoind` (version 0.15 or
+tweaking), and requires a locally running `bitcoindiamondd` (version 1.1.0 or
 above) that is fully caught up with the network you're testing on.
 Pruning (prune=n option in bitcoin.conf) is not currently supported.
 
@@ -58,42 +28,35 @@ For the impatient here's the gist of it for Ubuntu and Debian:
     sudo apt-get update
     sudo apt-get install -y \
       autoconf automake build-essential git libtool libgmp-dev \
-      libsqlite3-dev python python3 net-tools libsodium-dev
-    git clone https://github.com/ElementsProject/lightning.git
+      libsqlite3-dev python python3 net-tools zlib1g-dev
+    git clone https://github.com/eveybcd/lightning.git
     cd lightning
+    ./configure
     make
-
-Or if you like to throw `docker` into the mix:
-
-    sudo docker run \
-    	-v $HOME/.lightning:/root/.lightning \
-    	-v $HOME/.bitcoin:/root/.bitcoin \
-    	-p 9735:9735 \
-    	cdecker/lightningd:latest
 
 ### Starting `lightningd`
 
-In order to start `lightningd` you will need to have a local `bitcoind`
+In order to start `lightningd` you will need to have a local `bitcoindiamondd`
 node running in either testnet or regtest mode:
 
-    bitcoind -daemon -testnet
+    bitcoindiamondd -daemon -testnet
 
-Wait until `bitcoind` has synchronized with the testnet network.
+Wait until `bitcoindiamondd` has synchronized with the testnet network.
 
 Make sure that you do not have `walletbroadcast=0` in your
-`~/.bitcoin/bitcoin.conf`, or you may run into trouble.
+`~/.bitcoindiamond/bitcoin.conf`, or you may run into trouble.
 Notice that currently pruned nodes are not supported and may result in
 `lightningd` being unable to synchronize with the blockchain.
 
 You can start `lightningd` with the following command:
 
-    lightningd/lightningd --network=testnet --log-level=debug
+    lightningd/lightningd --network=bitcoindiamond-testnet --log-level=debug --dev-override-fee-rates=1010/1010/1010
 
 ### Listing all commands:
 `cli/lightning-cli help` will print a table of the API and lists the
 following commands
 
-### Opening a channel on the Bitcoin testnet
+### Opening a channel on the BitcoinDiamond testnet
 
 First you need to transfer some funds to `lightningd` so that it can
 open a channel:
@@ -102,16 +65,15 @@ open a channel:
     cli/lightning-cli newaddr
 
     # Returns a transaction id <txid>
-    bitcoin-cli -testnet sendtoaddress <address> <amount_in_bitcoins>
+    bitcoindiamond-cli -testnet sendtoaddress <address> <amount_in_bitcoindiamonds>
 
 `lightningd` will register the funds once the transaction is confirmed.
 
 If you don't have any testcoins you can get a few from a faucet such as
-[TPs' testnet faucet][tps] or [Kiwi's testnet faucet][kiw].
+[BCD testnet faucet][tps].
 You can send it directly to the `lightningd` address.
 
-[tps]: http://tpfaucet.appspot.com/
-[kiw]: https://testnet.manu.backend.hamburg/faucet
+[tps]: http://faucet.test.btcd.io/
 
 Confirm `lightningd` got funds by:
 
@@ -203,7 +165,7 @@ the file, for example:
 alias=SLEEPYDRAGON
 rgb=008000
 port=9735
-network=testnet
+network=bitcoindiamond-testnet
 ```
 
 For a full list of possible lightningd configuration options, run:

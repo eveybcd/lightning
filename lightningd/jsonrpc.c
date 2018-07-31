@@ -13,6 +13,7 @@
 #include <common/json_escaped.h>
 #include <common/memleak.h>
 #include <common/version.h>
+#include <common/wallet_tx.h>
 #include <common/wireaddr.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -106,7 +107,8 @@ static void json_rhash(struct command *cmd,
 	if (!hex_decode(buffer + secrettok->start,
 			secrettok->end - secrettok->start,
 			&secret, sizeof(secret))) {
-		command_fail(cmd, "'%.*s' is not a valid 32-byte hex value",
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "'%.*s' is not a valid 32-byte hex value",
 			     secrettok->end - secrettok->start,
 			     buffer + secrettok->start);
 		return;
@@ -148,11 +150,23 @@ static void json_getinfo(struct command *cmd,
 
 	json_object_start(response, NULL);
 	json_add_pubkey(response, "id", &cmd->ld->id);
-	if (cmd->ld->portnum) {
-		json_add_num(response, "port", cmd->ld->portnum);
+	json_add_string(response, "alias", (const char *)cmd->ld->alias);
+	json_add_hex(response, "color", (const void *)cmd->ld->rgb, tal_len(cmd->ld->rgb));
+	if (cmd->ld->listen) {
+		if (deprecated_apis)
+			json_add_num(response, "port", cmd->ld->portnum);
+
+		/* These are the addresses we're announcing */
 		json_array_start(response, "address");
-		for (size_t i = 0; i < tal_count(cmd->ld->wireaddrs); i++)
-			json_add_address(response, NULL, cmd->ld->wireaddrs+i);
+		for (size_t i = 0; i < tal_count(cmd->ld->announcable); i++)
+			json_add_address(response, NULL, cmd->ld->announcable+i);
+		json_array_end(response);
+
+		/* This is what we're actually bound to. */
+		json_array_start(response, "binding");
+		for (size_t i = 0; i < tal_count(cmd->ld->binding); i++)
+			json_add_address_internal(response, NULL,
+						  cmd->ld->binding+i);
 		json_array_end(response);
 	}
 	json_add_string(response, "version", version());
@@ -214,7 +228,8 @@ static void json_help(struct command *cmd,
 				goto done;
 			}
 		}
-		command_fail(cmd, "Unknown command '%.*s'",
+		command_fail(cmd, JSONRPC2_METHOD_NOT_FOUND,
+			     "Unknown command '%.*s'",
 			     cmdtok->end - cmdtok->start,
 			     buffer + cmdtok->start);
 		return;
@@ -369,13 +384,15 @@ static void command_fail_v(struct command *cmd,
 	assert(cmd_in_jcon(jcon, cmd));
 	connection_complete_error(jcon, cmd, cmd->id, error, code, data);
 }
-void command_fail(struct command *cmd, const char *fmt, ...)
+
+void command_fail(struct command *cmd, int code, const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	command_fail_v(cmd, -1, NULL, fmt, ap);
+	command_fail_v(cmd, code, NULL, fmt, ap);
 	va_end(ap);
 }
+
 void command_fail_detailed(struct command *cmd,
 			   int code, const struct json_result *data,
 			   const char *fmt, ...)
@@ -440,34 +457,30 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	tal_add_destructor(c, destroy_cmd);
 
 	if (!method || !params) {
-		command_fail_detailed(c,
-				      JSONRPC2_INVALID_REQUEST, NULL,
-				      method ? "No params" : "No method");
+		command_fail(c, JSONRPC2_INVALID_REQUEST,
+			     method ? "No params" : "No method");
 		return;
 	}
 
 	if (method->type != JSMN_STRING) {
-		command_fail_detailed(c,
-				      JSONRPC2_INVALID_REQUEST, NULL,
-				      "Expected string for method");
+		command_fail(c, JSONRPC2_INVALID_REQUEST,
+			     "Expected string for method");
 		return;
 	}
 
 	cmd = find_cmd(jcon->buffer, method);
 	if (!cmd) {
-		command_fail_detailed(c,
-				      JSONRPC2_METHOD_NOT_FOUND, NULL,
-				      "Unknown command '%.*s'",
-				      method->end - method->start,
-				      jcon->buffer + method->start);
+		command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
+			     "Unknown command '%.*s'",
+			     method->end - method->start,
+			     jcon->buffer + method->start);
 		return;
 	}
 	if (cmd->deprecated && !deprecated_apis) {
-		command_fail_detailed(c,
-				      JSONRPC2_METHOD_NOT_FOUND, NULL,
-				      "Command '%.*s' is deprecated",
-				      method->end - method->start,
-				      jcon->buffer + method->start);
+		command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
+			     "Command '%.*s' is deprecated",
+			      method->end - method->start,
+			      jcon->buffer + method->start);
 		return;
 	}
 
@@ -496,8 +509,8 @@ bool json_get_params(struct command *cmd,
 			p = param + 1;
 		end = json_next(param);
 	} else if (param->type != JSMN_OBJECT) {
-		command_fail_detailed(cmd, JSONRPC2_INVALID_PARAMS, NULL,
-				      "Expected array or object for params");
+		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			     "Expected array or object for params");
 		return false;
 	}
 
@@ -530,9 +543,9 @@ bool json_get_params(struct command *cmd,
 		}
 		if (compulsory && !*tokptr) {
 			va_end(ap);
-			command_fail_detailed(cmd, JSONRPC2_INVALID_PARAMS, NULL,
-					      "Missing '%s' parameter",
-					      names[num_names]);
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "Missing '%s' parameter",
+				      names[num_names]);
 			return false;
 		}
 		num_names++;
@@ -545,10 +558,10 @@ bool json_get_params(struct command *cmd,
 	if (param->type == JSMN_ARRAY) {
 		if (param->size > num_names) {
 			tal_free(names);
-			command_fail_detailed(cmd, JSONRPC2_INVALID_PARAMS, NULL,
-					      "Too many parameters:"
-					      " got %u, expected %zu",
-					      param->size, num_names);
+			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				     "Too many parameters:"
+				     " got %u, expected %zu",
+				     param->size, num_names);
 			return false;
 		}
 	} else {
@@ -565,12 +578,10 @@ bool json_get_params(struct command *cmd,
 			}
 			if (!found) {
 				tal_free(names);
-				command_fail_detailed(cmd,
-						      JSONRPC2_INVALID_PARAMS,
-						      NULL,
-						      "Unknown parameter '%.*s'",
-						      t->end - t->start,
-						      buffer + t->start);
+				command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					     "Unknown parameter '%.*s'",
+					     t->end - t->start,
+					     buffer + t->start);
 				return false;
 			}
 		}
@@ -852,3 +863,17 @@ json_tok_address_scriptpubkey(const tal_t *cxt,
 
 	return ADDRESS_PARSE_UNRECOGNIZED;
 }
+
+bool json_tok_wtx(struct wallet_tx * tx, const char * buffer,
+                  const jsmntok_t *sattok)
+{
+        if (json_tok_streq(buffer, sattok, "all")) {
+                tx->all_funds = true;
+        } else if (!json_tok_u64(buffer, sattok, &tx->amount)) {
+                command_fail(tx->cmd, JSONRPC2_INVALID_PARAMS,
+			     "Invalid satoshis");
+                return false;
+        }
+        return true;
+}
+

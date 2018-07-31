@@ -1,7 +1,12 @@
+#include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
 #include <ccan/fdpass/fdpass.h>
 #include <channeld/gen_channel_wire.h>
+#include <common/memleak.h>
+#include <common/timeout.h>
+#include <common/utils.h>
 #include <errno.h>
+#include <gossipd/gossip_constants.h>
 #include <hsmd/capabilities.h>
 #include <hsmd/gen_hsm_client_wire.h>
 #include <inttypes.h>
@@ -13,6 +18,15 @@
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <wire/wire_sync.h>
+
+static void lockin_complete(struct channel *channel)
+{
+	/* We set this once we're locked in. */
+	assert(channel->scid);
+	/* We set this once they're locked in. */
+	assert(channel->remote_funding_locked);
+	channel_set_state(channel, CHANNELD_AWAITING_LOCKIN, CHANNELD_NORMAL);
+}
 
 /* We were informed by channeld that it announced the channel and sent
  * an update, so we can now start sending a node_announcement. The
@@ -40,6 +54,9 @@ static void peer_got_funding_locked(struct channel *channel, const u8 *msg)
 
 	log_debug(channel->log, "Got funding_locked");
 	channel->remote_funding_locked = true;
+
+	if (channel->scid)
+		lockin_complete(channel);
 }
 
 static void peer_got_shutdown(struct channel *channel, const u8 *msg)
@@ -59,16 +76,17 @@ static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 
 	/* BOLT #2:
 	 *
-	 * A sending node MUST set `scriptpubkey` to one of the following forms:
-	 *
 	 * 1. `OP_DUP` `OP_HASH160` `20` 20-bytes `OP_EQUALVERIFY` `OP_CHECKSIG`
 	 *   (pay to pubkey hash), OR
 	 * 2. `OP_HASH160` `20` 20-bytes `OP_EQUAL` (pay to script hash), OR
 	 * 3. `OP_0` `20` 20-bytes (version 0 pay to witness pubkey), OR
 	 * 4. `OP_0` `32` 32-bytes (version 0 pay to witness script hash)
 	 *
-	 * A receiving node SHOULD fail the connection if the `scriptpubkey`
-	 * is not one of those forms. */
+	 * A receiving node:
+	 *...
+	 *  - if the `scriptpubkey` is not in one of the above forms:
+	 *    - SHOULD fail the connection.
+	 */
 	if (!is_p2pkh(scriptpubkey, NULL) && !is_p2sh(scriptpubkey, NULL)
 	    && !is_p2wpkh(scriptpubkey, NULL) && !is_p2wsh(scriptpubkey, NULL)) {
 		channel_fail_permanent(channel, "Bad shutdown scriptpubkey %s",
@@ -90,19 +108,18 @@ static void peer_start_closingd_after_shutdown(struct channel *channel,
 					       const int *fds)
 {
 	struct crypto_state cs;
-	u64 gossip_index;
 
 	/* We expect 2 fds. */
 	assert(tal_count(fds) == 2);
 
-	if (!fromwire_channel_shutdown_complete(msg, &cs, &gossip_index)) {
+	if (!fromwire_channel_shutdown_complete(msg, &cs)) {
 		channel_internal_error(channel, "bad shutdown_complete: %s",
 				       tal_hex(msg, msg));
 		return;
 	}
 
 	/* This sets channel->owner, closes down channeld. */
-	peer_start_closingd(channel, &cs, gossip_index, fds[0], fds[1], false);
+	peer_start_closingd(channel, &cs, fds[0], fds[1], false, NULL);
 	channel_set_state(channel, CHANNELD_SHUTTING_DOWN, CLOSINGD_SIGEXCHANGE);
 }
 
@@ -111,10 +128,6 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	enum channel_wire_type t = fromwire_peektype(msg);
 
 	switch (t) {
-	case WIRE_CHANNEL_NORMAL_OPERATION:
-		channel_set_state(sd->channel,
-				  CHANNELD_AWAITING_LOCKIN, CHANNELD_NORMAL);
-		break;
 	case WIRE_CHANNEL_SENDING_COMMITSIG:
 		peer_sending_commitsig(sd->channel, msg);
 		break;
@@ -140,7 +153,6 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	/* And we never get these from channeld. */
 	case WIRE_CHANNEL_INIT:
 	case WIRE_CHANNEL_FUNDING_LOCKED:
-	case WIRE_CHANNEL_FUNDING_ANNOUNCE_DEPTH:
 	case WIRE_CHANNEL_OFFER_HTLC:
 	case WIRE_CHANNEL_FULFILL_HTLC:
 	case WIRE_CHANNEL_FAIL_HTLC:
@@ -163,7 +175,6 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 
 bool peer_start_channeld(struct channel *channel,
 			 const struct crypto_state *cs,
-			 u64 gossip_index,
 			 int peer_fd, int gossip_fd,
 			 const u8 *funding_signed,
 			 bool reconnected)
@@ -180,6 +191,7 @@ bool peer_start_channeld(struct channel *channel,
 	u64 num_revocations;
 	struct lightningd *ld = channel->peer->ld;
 	const struct config *cfg = &ld->config;
+	bool reached_announce_depth;
 
 	msg = towire_hsm_client_hsmfd(tmpctx, &channel->peer->id, HSM_CAP_SIGN_GOSSIP | HSM_CAP_ECDH);
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
@@ -193,9 +205,10 @@ bool peer_start_channeld(struct channel *channel,
 	if (hsmfd < 0)
 		fatal("Could not read fd from HSM: %s", strerror(errno));
 
-	channel_set_owner(channel, new_channel_subd(ld,
+	channel_set_owner(channel,
+			  new_channel_subd(ld,
 					   "lightning_channeld", channel,
-					   channel->log,
+					   channel->log, true,
 					   channel_wire_type_name,
 					   channel_msg,
 					   channel_errmsg,
@@ -216,10 +229,16 @@ bool peer_start_channeld(struct channel *channel,
 
 	if (channel->scid) {
 		funding_channel_id = *channel->scid;
-		log_debug(channel->log, "Already have funding locked in");
+		reached_announce_depth
+			= (short_channel_id_blocknum(&funding_channel_id)
+			   + ANNOUNCE_MIN_DEPTH <= get_block_height(ld->topology));
+		log_debug(channel->log, "Already have funding locked in%s",
+			  reached_announce_depth
+			  ? " (and ready to announce)" : "");
 	} else {
 		log_debug(channel->log, "Waiting for funding confirmations");
 		memset(&funding_channel_id, 0, sizeof(funding_channel_id));
+		reached_announce_depth = false;
 	}
 
 	num_revocations = revocations_received(&channel->their_shachain.chain);
@@ -239,7 +258,7 @@ bool peer_start_channeld(struct channel *channel,
 				      feerate_min(ld),
 				      feerate_max(ld),
 				      &channel->last_sig,
-				      cs, gossip_index,
+				      cs,
 				      &channel->channel_info.remote_fundingkey,
 				      &channel->channel_info.theirbase.revocation,
 				      &channel->channel_info.theirbase.payment,
@@ -254,7 +273,7 @@ bool peer_start_channeld(struct channel *channel,
 				      &channel->seed,
 				      &ld->id,
 				      &channel->peer->id,
-				      time_to_msec(cfg->commit_time),
+				      cfg->commit_time_ms,
 				      cfg->cltv_expiry_delta,
 				      channel->last_was_revoke,
 				      channel->last_sent_commit,
@@ -274,10 +293,127 @@ bool peer_start_channeld(struct channel *channel,
 				      p2wpkh_for_keyidx(tmpctx, ld,
 							channel->final_key_idx),
 				      channel->channel_flags,
-				      funding_signed);
+				      funding_signed,
+				      reached_announce_depth);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
 
 	return true;
+}
+
+bool channel_tell_funding_locked(struct lightningd *ld,
+				 struct channel *channel,
+				 const struct bitcoin_txid *txid,
+				 u32 depth)
+{
+	/* If not awaiting lockin/announce, it doesn't care any more */
+	if (channel->state != CHANNELD_AWAITING_LOCKIN
+	    && channel->state != CHANNELD_NORMAL) {
+		log_debug(channel->log,
+			  "Funding tx confirmed, but peer in state %s",
+			  channel_state_name(channel));
+		return true;
+	}
+
+	if (!channel->owner) {
+		log_debug(channel->log,
+			  "Funding tx confirmed, but peer disconnected");
+		return false;
+	}
+
+	subd_send_msg(channel->owner,
+		      take(towire_channel_funding_locked(NULL, channel->scid,
+							 depth)));
+
+	if (channel->remote_funding_locked
+	    && channel->state == CHANNELD_AWAITING_LOCKIN)
+		lockin_complete(channel);
+
+	return true;
+}
+
+/* Check if we are the fundee of this channel, the channel
+ * funding transaction is still not yet seen onchain, and
+ * it has been too long since the channel was first opened.
+ * If so, we should forget the channel. */
+static bool
+is_fundee_should_forget(struct lightningd *ld,
+			struct channel *channel,
+			u32 block_height)
+{
+	u32 max_funding_unconfirmed = ld->max_funding_unconfirmed;
+
+	/* BOLT #2:
+	 *
+	 * A non-funding node (fundee):
+	 *   - SHOULD forget the channel if it does not see the
+	 * funding transaction after a reasonable timeout.
+	 */
+
+	/* Only applies if we are fundee. */
+	if (channel->funder == LOCAL)
+		return false;
+
+	/* Does not apply if we already saw the funding tx. */
+	if (channel->scid)
+		return false;
+
+	/* Not even reached previous starting blocknum.
+	 * (e.g. if --rescan option is used) */
+	if (block_height < channel->first_blocknum)
+		return false;
+
+	/* Timeout in blocks not yet reached. */
+	if (block_height - channel->first_blocknum < max_funding_unconfirmed)
+		return false;
+
+	/* Ah forget it! */
+	return true;
+}
+
+/* Notify all channels of new blocks. */
+void channel_notify_new_block(struct lightningd *ld,
+			      u32 block_height)
+{
+	struct peer *peer;
+	struct channel *channel;
+	struct channel **to_forget = tal_arr(NULL, struct channel *, 0);
+	size_t i;
+
+	list_for_each (&ld->peers, peer, list) {
+		list_for_each (&peer->channels, channel, list)
+			if (is_fundee_should_forget(ld, channel, block_height)) {
+				i = tal_count(to_forget);
+				tal_resize(&to_forget, i + 1);
+				to_forget[i] = channel;
+			}
+	}
+
+	/* Need to forget in a separate loop, else the above
+	 * nested loops may crash due to the last channel of
+	 * a peer also deleting the peer, making the inner
+	 * loop crash.
+	 * list_for_each_safe does not work because it is not
+	 * just the freeing of the channel that occurs, but the
+	 * potential destruction of the peer that invalidates
+	 * memory the inner loop is accessing. */
+	for (i = 0; i < tal_count(to_forget); ++i) {
+		channel = to_forget[i];
+		/* Report it first. */
+		log_unusual(channel->log,
+			    "Forgetting channel: "
+			    "It has been %"PRIu32" blocks without the "
+			    "funding transaction %s getting deeply "
+			    "confirmed. "
+			    "We are fundee and can forget channel without "
+			    "loss of funds.",
+			    block_height - channel->first_blocknum,
+			    type_to_string(tmpctx, struct bitcoin_txid,
+					   &channel->funding_txid));
+		/* And forget it. */
+		delete_channel(channel);
+	}
+
+	tal_free(to_forget);
 }

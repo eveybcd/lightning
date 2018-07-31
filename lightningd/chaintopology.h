@@ -72,7 +72,7 @@ static inline size_t hash_sha(const struct bitcoin_blkid *key)
 
 static inline bool block_eq(const struct block *b, const struct bitcoin_blkid *key)
 {
-	return structeq(&b->blkid, key);
+	return bitcoin_blkid_eq(&b->blkid, key);
 }
 HTABLE_DEFINE_TYPE(struct block, keyof_block_map, hash_sha, block_eq, block_map);
 
@@ -89,11 +89,11 @@ struct chain_topology {
 	/* Where to log things. */
 	struct log *log;
 
-	/* How far back (in blocks) to go. */
-	unsigned int first_blocknum;
+	/* What range of blocks do we have in our database? */
+	u32 min_blockheight, max_blockheight;
 
 	/* How often to poll. */
-	struct timerel poll_time;
+	u32 poll_seconds;
 
 	/* The bitcoind. */
 	struct bitcoind *bitcoind;
@@ -104,15 +104,17 @@ struct chain_topology {
 	/* Bitcoin transactions we're broadcasting */
 	struct list_head outgoing_txs;
 
-	/* Force a particular fee rate regardless of estimatefee (satoshis/kw) */
-	u32 *override_fee_rate;
-
 	/* What fee we use if estimatefee fails (satoshis/kw) */
 	u32 default_fee_rate;
 
 	/* Transactions/txos we are watching. */
 	struct txwatch_hash txwatches;
 	struct txowatch_hash txowatches;
+
+#if DEVELOPER
+	/* Force a particular fee rate regardless of estimatefee (satoshis/kw) */
+	u32 *dev_override_fee_rate;
+#endif
 };
 
 /* Information relevant to locating a TX in a blockchain. */
@@ -145,15 +147,13 @@ void broadcast_tx(struct chain_topology *topo,
 				 const char *err));
 
 struct chain_topology *new_topology(struct lightningd *ld, struct log *log);
-void setup_topology(struct chain_topology *topology,
-		    struct timers *timers,
-		    struct timerel poll_time, u32 first_channel_block);
+void setup_topology(struct chain_topology *topology, struct timers *timers,
+		    u32 min_blockheight, u32 max_blockheight);
 
 void begin_topology(struct chain_topology *topo);
 
 struct txlocator *locate_tx(const void *ctx, const struct chain_topology *topo, const struct bitcoin_txid *txid);
 
-void notify_new_block(struct lightningd *ld, unsigned int height);
 void notify_feerate_change(struct lightningd *ld);
 
 #if DEVELOPER
