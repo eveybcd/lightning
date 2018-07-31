@@ -23,8 +23,8 @@ For actually doing development and running the tests, you will also need:
 * asciidoc: for formatting the man pages (if you change them)
 * valgrind: for extra debugging checks
 
-You will also need a version of bitcoind with segregated witness and
-estimatesmartfee economical node, such as the 0.15 or above.
+You will also need a version of bitcoindiamondd with segregated witness and
+estimatesmartfee economical node, such as the 1.1.0 or above.
 
 To Build on Ubuntu
 ---------------------
@@ -38,14 +38,6 @@ Get dependencies:
       autoconf automake build-essential git libtool libgmp-dev \
       libsqlite3-dev python python3 net-tools zlib1g-dev
 
-If you don't have Bitcoin installed locally you'll need to install that
-as well:
-
-    sudo apt-get install software-properties-common
-    sudo add-apt-repository ppa:bitcoin/bitcoin
-    sudo apt-get update
-    sudo apt-get install -y bitcoind
-
 For development or running tests, get additional dependencies:
 
     sudo apt-get install -y asciidoc valgrind python3-pip
@@ -53,7 +45,7 @@ For development or running tests, get additional dependencies:
 
 Clone lightning:
 
-    git clone https://github.com/ElementsProject/lightning.git
+    git clone https://github.com/eveybcd/lightning.git
     cd lightning
 
 Build lightning:
@@ -63,7 +55,7 @@ Build lightning:
 
 Running lightning:
 
-    bitcoind &
+    bitcoindiamondd &
     ./lightningd/lightningd &
     ./cli/lightning-cli help
 
@@ -97,11 +89,11 @@ $ sudo dnf update -y && \
         sudo dnf clean all
 ```
 
-Make sure you have [bitcoind](https://github.com/bitcoin/bitcoin) available to run
+Make sure you have [bitcoindiamondd](https://github.com/eveybcd/BitcoinDiamond) available to run
 
 Clone lightning:
 ```
-$ git clone https://github.com/ElementsProject/lightning.git
+$ git clone https://github.com/eveybcd/lightning.git
 $ cd lightning
 ```
 
@@ -114,14 +106,14 @@ $lightning> sudo make install
 
 Running lightning (mainnet):
 ```
-$ bitcoind &
-$ lightningd --network=bitcoin
+$ bitcoindiamondd &
+$ lightningd --network=bitcoindiamond
 ```
 
 Running lightning on testnet:
 ```
-$ bitcoind -testnet &
-$ lightningd --network=testnet
+$ bitcoindiamondd -testnet &
+$ lightningd --network=bitcoindiamond-testnet
 ```
 
 To Build on FreeBSD
@@ -134,14 +126,9 @@ Get dependencies:
     # pkg install -y \
       autoconf automake git gmp asciidoc gmake libtool python python3 sqlite3
 
-If you don't have Bitcoin installed locally you'll need to install that
-as well:
-
-    # pkg install -y bitcoin-daemon bitcoin-utils
-
 Clone lightning:
 
-    $ git clone https://github.com/ElementsProject/lightning.git
+    $ git clone https://github.com/eveybcd/lightning.git
     $ cd lightning
 
 Build lightning:
@@ -152,11 +139,6 @@ Build lightning:
 
 Running lightning:
 
-**Note**: Edit your `/usr/local/etc/bitcoin.conf` to include
-`rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also need to
-include `testnet=1`
-
-    # service bitcoind start
     $ ./lightningd/lightningd &
     $ ./cli/lightning-cli help
 
@@ -179,20 +161,20 @@ Get dependencies:
 
     $ brew install autoconf automake libtool python3 gmp gnu-sed
 
-If you don't have bitcoind installed locally you'll need to install that
+If you don't have bitcoindiamondd installed locally you'll need to install that
 as well:
 
     $ brew install \
     berkeley-db4 boost miniupnpc openssl pkg-config protobuf qt libevent
-    $ git clone https://github.com/bitcoin/bitcoin
-    $ cd bitcoin
+    $ git clone https://github.com/eveybcd/BitcoinDiamond
+    $ cd BitcoinDiamond
     $ ./autogen.sh
     $ ./configure
     $ make & make install
 
 Clone lightning:
 
-    $ git clone https://github.com/ElementsProject/lightning.git
+    $ git clone https://github.com/eveybcd/lightning.git
     $ cd lightning
 
 Build lightning:
@@ -202,11 +184,11 @@ Build lightning:
 
 Running lightning:
 
-**Note**: Edit your `~/Library/Application\ Support/Bitcoin/bitcoin.conf`
+**Note**: Edit your `~/Library/Application\ Support/BitcoinDiamond/bitcoin.conf`
 to include `rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also
 need to include `testnet=1`
 
-    bitcoind &
+    bitcoindiamondd &
     ./lightningd/lightningd &
     ./cli/lightning-cli help
 
@@ -284,4 +266,4 @@ be found [here](https://github.com/Sjors/armbian-bitcoin-core).
 
 Additional steps
 --------------------
-Go to [README](https://github.com/ElementsProject/lightning/blob/master/README.md) for more information how to create an address, add funds, connect to a node, etc.
+Go to [README](https://github.com/eveybcd/lightning/blob/master/README.md) for more information how to create an address, add funds, connect to a node, etc.

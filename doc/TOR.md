@@ -134,7 +134,7 @@ the .onion addr will show with the cli command getinfo
 the node is accessible by connect peerid xxxxxxxxxxxxxxxx.onion 9735
 or local by connect peerID 127.0.0.1 1234
 
-lightningd/lightningd --network=testnet --bind-addr=127.0.0.1
+lightningd/lightningd --network=bitcoindiamond-testnet --bind-addr=127.0.0.1
 --proxy=127.0.0.1:9050 --announce-addr=xxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion:1234
 
 this will use the hidden-service V2 or V3 set by /etc/tor/torrc and use the hidden service
